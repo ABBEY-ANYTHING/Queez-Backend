@@ -22,7 +22,8 @@ from app.api.routes import (
     leaderboard,
     categories,
     websocket,
-    live_multiplayer
+    live_multiplayer,
+    notes
 )
 
 app = FastAPI(
@@ -43,6 +44,7 @@ app.add_middleware(
 # Include routers
 app.include_router(quizzes.router)
 app.include_router(flashcards.router)
+app.include_router(notes.router)
 app.include_router(library.router)
 app.include_router(sessions.router)
 app.include_router(analytics.router)
