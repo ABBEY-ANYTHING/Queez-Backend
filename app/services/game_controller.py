@@ -222,10 +222,14 @@ class GameController:
             elif question_type == "dragAndDrop":
                 correct_answer_response = question.get("correctMatches", {})
             
+            # Store the answer for returning
+            stored_answer = answer
+            
             return {
                 "is_correct": is_correct,
                 "points": points,
                 "correct_answer": correct_answer_response,
+                "user_answer": stored_answer,
                 "new_total_score": participant["score"],
                 "question_type": question_type
             }
