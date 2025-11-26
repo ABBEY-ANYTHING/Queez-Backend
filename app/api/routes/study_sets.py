@@ -83,7 +83,7 @@ class StudySetCreate(BaseModel):
     notes: List[dict] = []
 
 
-@router.post("/", status_code=status.HTTP_201_CREATED)
+@router.post("", status_code=status.HTTP_201_CREATED)
 async def create_study_set(study_set: StudySetCreate):
     """Create a new study set"""
     try:
@@ -95,9 +95,9 @@ async def create_study_set(study_set: StudySetCreate):
         result = await study_sets_collection.insert_one(study_set_data)
         
         return {
+            "id": str(result.inserted_id),
             "success": True,
-            "message": "Study set created successfully",
-            "studySetId": str(result.inserted_id)
+            "message": "Study set created successfully"
         }
     except Exception as e:
         raise HTTPException(
