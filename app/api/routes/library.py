@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from typing import List, Union
 from app.core.database import db
+from app.services.firestore_service import firestore_db
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/library", tags=["library"])
@@ -82,6 +83,21 @@ async def get_unified_library(user_id: str):
         )
         notes = await note_cursor.to_list(length=None)
         
+        # Fetch study sets from Firestore
+        study_sets = []
+        try:
+            study_sets_ref = firestore_db.collection('study_sets')
+            query = study_sets_ref.where('ownerId', '==', user_id)
+            docs = query.stream()
+            
+            for doc in docs:
+                study_set_data = doc.to_dict()
+                study_set_data['_id'] = doc.id
+                study_sets.append(study_set_data)
+        except Exception as e:
+            print(f"Error fetching study sets: {e}")
+            # Continue even if study sets fail
+        
         # Convert quizzes to LibraryItem
         library_items = []
         for quiz in quizzes:
@@ -126,6 +142,27 @@ async def get_unified_library(user_id: str):
                 createdAt=note.get("createdAt", ""),
                 itemCount=0,  # Notes don't have a count
                 category=note.get("category", ""),
+                originalOwner=None,
+                originalOwnerUsername=None
+            ))
+        
+        # Convert study sets to LibraryItem
+        for study_set in study_sets:
+            total_items = (
+                len(study_set.get('quizzes', [])) +
+                len(study_set.get('flashcardSets', [])) +
+                len(study_set.get('notes', []))
+            )
+            library_items.append(LibraryItem(
+                id=str(study_set["_id"]),
+                type="study_set",
+                title=study_set.get("name", "Untitled Study Set"),
+                description=study_set.get("description", ""),
+                coverImagePath=study_set.get("coverImagePath") or fallback_image,
+                createdAt=study_set.get("createdAt", ""),
+                itemCount=total_items,
+                category=study_set.get("category", ""),
+                language=study_set.get("language", ""),
                 originalOwner=None,
                 originalOwnerUsername=None
             ))

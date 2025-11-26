@@ -23,7 +23,8 @@ from app.api.routes import (
     categories,
     websocket,
     live_multiplayer,
-    notes
+    notes,
+    study_sets
 )
 
 app = FastAPI(
@@ -45,6 +46,7 @@ app.add_middleware(
 app.include_router(quizzes.router)
 app.include_router(flashcards.router)
 app.include_router(notes.router)
+app.include_router(study_sets.router)
 app.include_router(library.router)
 app.include_router(sessions.router)
 app.include_router(analytics.router)
