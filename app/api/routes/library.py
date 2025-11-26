@@ -1,7 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from typing import List, Union
 from app.core.database import db
-from app.services.firestore_service import firestore_db
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/library", tags=["library"])
@@ -10,6 +9,7 @@ router = APIRouter(prefix="/library", tags=["library"])
 quiz_collection = db["quizzes"]
 flashcard_collection = db["flashcard_sets"]
 note_collection = db["notes"]
+study_sets_collection = db["study_sets"]
 
 class LibraryItem(BaseModel):
     id: str
@@ -83,20 +83,13 @@ async def get_unified_library(user_id: str):
         )
         notes = await note_cursor.to_list(length=None)
         
-        # Fetch study sets from Firestore
+        # Fetch study sets from MongoDB
         study_sets = []
         try:
-            study_sets_ref = firestore_db.collection('study_sets')
-            query = study_sets_ref.where('ownerId', '==', user_id)
-            docs = query.stream()
-            
-            for doc in docs:
-                study_set_data = doc.to_dict()
-                study_set_data['_id'] = doc.id
-                study_sets.append(study_set_data)
+            study_sets_cursor = study_sets_collection.find({\"ownerId\": user_id})
+            study_sets = await study_sets_cursor.to_list(length=None)
         except Exception as e:
-            print(f"Error fetching study sets: {e}")
-            # Continue even if study sets fail
+            print(f\"Error fetching study sets: {e}\")\n            # Continue even if study sets fail
         
         # Convert quizzes to LibraryItem
         library_items = []

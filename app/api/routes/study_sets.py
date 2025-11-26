@@ -2,10 +2,14 @@ from fastapi import APIRouter, HTTPException, status
 from typing import List, Optional
 from pydantic import BaseModel
 from datetime import datetime
+from bson import ObjectId
 
-from app.services.firestore_service import firestore_db
+from app.core.database import db
 
 router = APIRouter(prefix="/study-sets", tags=["Study Sets"])
+
+# Get study sets collection
+study_sets_collection = db["study_sets"]
 
 
 # Pydantic Models
@@ -87,13 +91,13 @@ async def create_study_set(study_set: StudySetCreate):
         study_set_data['createdAt'] = datetime.utcnow().isoformat()
         study_set_data['updatedAt'] = datetime.utcnow().isoformat()
         
-        # Save to Firestore
-        firestore_db.collection('study_sets').document(study_set.id).set(study_set_data)
+        # Save to MongoDB
+        result = await study_sets_collection.insert_one(study_set_data)
         
         return {
             "success": True,
             "message": "Study set created successfully",
-            "studySetId": study_set.id
+            "studySetId": str(result.inserted_id)
         }
     except Exception as e:
         raise HTTPException(
@@ -106,20 +110,20 @@ async def create_study_set(study_set: StudySetCreate):
 async def get_study_set(study_set_id: str):
     """Get a study set by ID"""
     try:
-        doc = firestore_db.collection('study_sets').document(study_set_id).get()
+        doc = await study_sets_collection.find_one({"_id": ObjectId(study_set_id)})
         
-        if not doc.exists:
+        if not doc:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Study set not found"
             )
         
-        study_set_data = doc.to_dict()
-        study_set_data['id'] = doc.id
+        doc['id'] = str(doc['_id'])
+        del doc['_id']
         
         return {
             "success": True,
-            "studySet": study_set_data
+            "studySet": doc
         }
     except HTTPException:
         raise
@@ -134,15 +138,14 @@ async def get_study_set(study_set_id: str):
 async def get_user_study_sets(user_id: str):
     """Get all study sets for a user"""
     try:
-        study_sets_ref = firestore_db.collection('study_sets')
-        query = study_sets_ref.where('ownerId', '==', user_id).order_by('updatedAt', direction='DESCENDING')
-        docs = query.stream()
+        cursor = study_sets_collection.find({"ownerId": user_id}).sort("updatedAt", -1)
+        docs = await cursor.to_list(length=None)
         
         study_sets = []
         for doc in docs:
-            study_set_data = doc.to_dict()
-            study_set_data['id'] = doc.id
-            study_sets.append(study_set_data)
+            doc['id'] = str(doc['_id'])
+            del doc['_id']
+            study_sets.append(doc)
         
         return {
             "success": True,
@@ -160,10 +163,9 @@ async def get_user_study_sets(user_id: str):
 async def update_study_set(study_set_id: str, study_set: StudySetCreate):
     """Update a study set"""
     try:
-        doc_ref = firestore_db.collection('study_sets').document(study_set_id)
-        doc = doc_ref.get()
+        existing = await study_sets_collection.find_one({"_id": ObjectId(study_set_id)})
         
-        if not doc.exists:
+        if not existing:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Study set not found"
@@ -172,7 +174,10 @@ async def update_study_set(study_set_id: str, study_set: StudySetCreate):
         study_set_data = study_set.dict()
         study_set_data['updatedAt'] = datetime.utcnow().isoformat()
         
-        doc_ref.update(study_set_data)
+        await study_sets_collection.update_one(
+            {"_id": ObjectId(study_set_id)},
+            {"$set": study_set_data}
+        )
         
         return {
             "success": True,
@@ -191,16 +196,15 @@ async def update_study_set(study_set_id: str, study_set: StudySetCreate):
 async def delete_study_set(study_set_id: str):
     """Delete a study set"""
     try:
-        doc_ref = firestore_db.collection('study_sets').document(study_set_id)
-        doc = doc_ref.get()
+        existing = await study_sets_collection.find_one({"_id": ObjectId(study_set_id)})
         
-        if not doc.exists:
+        if not existing:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Study set not found"
             )
         
-        doc_ref.delete()
+        await study_sets_collection.delete_one({"_id": ObjectId(study_set_id)})
         
         return {
             "success": True,
@@ -219,32 +223,30 @@ async def delete_study_set(study_set_id: str):
 async def get_study_set_stats(study_set_id: str):
     """Get statistics for a study set"""
     try:
-        doc = firestore_db.collection('study_sets').document(study_set_id).get()
+        doc = await study_sets_collection.find_one({"_id": ObjectId(study_set_id)})
         
-        if not doc.exists:
+        if not doc:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Study set not found"
             )
         
-        study_set_data = doc.to_dict()
-        
         stats = {
-            "totalQuizzes": len(study_set_data.get('quizzes', [])),
-            "totalFlashcardSets": len(study_set_data.get('flashcardSets', [])),
-            "totalNotes": len(study_set_data.get('notes', [])),
+            "totalQuizzes": len(doc.get('quizzes', [])),
+            "totalFlashcardSets": len(doc.get('flashcardSets', [])),
+            "totalNotes": len(doc.get('notes', [])),
             "totalItems": (
-                len(study_set_data.get('quizzes', [])) +
-                len(study_set_data.get('flashcardSets', [])) +
-                len(study_set_data.get('notes', []))
+                len(doc.get('quizzes', [])) +
+                len(doc.get('flashcardSets', [])) +
+                len(doc.get('notes', []))
             ),
             "totalQuestions": sum(
                 len(quiz.get('questions', [])) 
-                for quiz in study_set_data.get('quizzes', [])
+                for quiz in doc.get('quizzes', [])
             ),
             "totalFlashcards": sum(
                 len(fs.get('cards', [])) 
-                for fs in study_set_data.get('flashcardSets', [])
+                for fs in doc.get('flashcardSets', [])
             )
         }
         
