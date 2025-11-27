@@ -390,7 +390,7 @@ async def handle_end_quiz(websocket: WebSocket, session_code: str, user_id: str)
         return
     
     # Mark session as completed
-    await session_manager.complete_session(session_code)
+    await session_manager.end_session(session_code)
     
     # Get final results
     final_results = await leaderboard_manager.get_final_results(session_code)

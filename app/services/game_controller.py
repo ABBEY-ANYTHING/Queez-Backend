@@ -63,11 +63,14 @@ class GameController:
         
         logger.info(f"✅ Retrieved question {current_index + 1}/{len(questions)}: {question_text[:50]}...")
         
-        # Calculate time remaining
-        time_remaining = QUESTION_TIME_SECONDS
+        # Get per-question time limit (default to global config if not set)
+        question_time_limit = question.get('timeLimit', QUESTION_TIME_SECONDS)
+        
+        # Calculate time remaining based on question's time limit
+        time_remaining = question_time_limit
         if start_time:
             elapsed = (datetime.utcnow() - datetime.fromisoformat(start_time)).total_seconds()
-            time_remaining = max(0, QUESTION_TIME_SECONDS - int(elapsed))
+            time_remaining = max(0, question_time_limit - int(elapsed))
         
         # Build question payload with normalized field names
         question_payload = {
@@ -76,6 +79,7 @@ class GameController:
             "type": question_type,  # Keep for backward compatibility
             "options": question.get('options', []),
             "id": question.get('id', str(current_index)),
+            "timeLimit": question_time_limit,  # Include time limit in payload
         }
         
         # Include optional fields if present
@@ -96,7 +100,8 @@ class GameController:
             "question": question_payload,
             "index": current_index,
             "total": len(questions),
-            "time_remaining": time_remaining
+            "time_remaining": time_remaining,
+            "time_limit": question_time_limit  # Include total time limit for scoring calculations
         }
 
     async def submit_answer(self, session_code: str, user_id: str, answer: Any, timestamp: float) -> Dict[str, Any]:
@@ -174,18 +179,31 @@ class GameController:
             logger.error(f"❌ Unknown question type: {question_type}")
             return {"error": "Unknown question type"}
         
-        # Calculate points (time-based scoring)
+        # Calculate points (time-based scoring with multiplier)
+        # Formula: 1000 base points + speed multiplier (up to 1000 bonus points)
+        # Faster answers get higher multipliers: 2x for instant, 1x at time limit
         points = 0
+        time_bonus = 0
+        multiplier = 1.0
+        
+        # Get per-question time limit
+        question_time_limit = question.get('timeLimit', QUESTION_TIME_SECONDS)
+        
         if is_correct:
             base_points = 1000
-            # Use timestamp if provided, otherwise no time bonus
-            time_bonus = 0
-            if timestamp:
-                # Assume 30 seconds per question
-                elapsed = min(timestamp, QUESTION_TIME_SECONDS)
-                time_bonus = int(max(0, (1 - elapsed / QUESTION_TIME_SECONDS) * 500))
+            # Calculate time-based multiplier
+            if timestamp is not None and timestamp >= 0:
+                # Clamp elapsed time to question's time limit
+                elapsed = min(timestamp, question_time_limit)
+                # Calculate multiplier: 2.0 at 0 seconds, 1.0 at time limit
+                # Linear interpolation: multiplier = 2.0 - (elapsed / time_limit)
+                multiplier = max(1.0, 2.0 - (elapsed / question_time_limit))
+                # Time bonus is the extra points from speed (base * (multiplier - 1))
+                time_bonus = int(base_points * (multiplier - 1))
+            
             points = base_points + time_bonus
-            logger.info(f"✅ Correct answer! Base: {base_points}, Time bonus: {time_bonus}, Total: {points}")
+            logger.info(f"✅ Correct answer! Base: {base_points}, Time bonus: {time_bonus} (multiplier: {multiplier:.2f}x), Total: {points}")
+            logger.info(f"⏱️ Time stats: elapsed={timestamp:.2f}s, limit={question_time_limit}s")
         
         # Update participant data
         participants = json.loads(participants_json)
@@ -228,6 +246,8 @@ class GameController:
             return {
                 "is_correct": is_correct,
                 "points": points,
+                "time_bonus": time_bonus,
+                "multiplier": round(multiplier, 2),
                 "correct_answer": correct_answer_response,
                 "user_answer": stored_answer,
                 "new_total_score": participant["score"],
@@ -248,6 +268,19 @@ class GameController:
         await self.redis.hset(session_key, "question_start_time", datetime.utcnow().isoformat())
         
         return True
+
+    async def next_question(self, session_code: str) -> Optional[Dict[str, Any]]:
+        """Advance to and return the next question"""
+        session_key = f"session:{session_code}"
+        
+        # Increment index
+        await self.redis.hincrby(session_key, "current_question_index", 1)
+        
+        # Reset start time for the new question
+        await self.redis.hset(session_key, "question_start_time", datetime.utcnow().isoformat())
+        
+        # Return the new current question
+        return await self.get_current_question(session_code)
         
     async def start_question_timer(self, session_code: str):
         """Start the timer for the current question"""
@@ -388,6 +421,9 @@ class GameController:
         
         logger.info(f"✅ Retrieved question {index + 1}/{len(questions)}: {question_text[:50]}...")
         
+        # Get per-question time limit
+        question_time_limit = question.get('timeLimit', QUESTION_TIME_SECONDS)
+        
         # Build question payload
         question_payload = {
             "question": question_text,
@@ -395,6 +431,7 @@ class GameController:
             "type": question_type,
             "options": question.get('options', []),
             "id": question.get('id', str(index)),
+            "timeLimit": question_time_limit,
         }
         
         # Include optional fields
@@ -415,5 +452,6 @@ class GameController:
             "question": question_payload,
             "index": index,
             "total": len(questions),
-            "time_remaining": QUESTION_TIME_SECONDS
+            "time_remaining": question_time_limit,
+            "time_limit": question_time_limit
         }

@@ -11,6 +11,7 @@ class Question(BaseModel):
     dragItems: Optional[List[str]] = None
     dropTargets: Optional[List[str]] = None
     correctMatches: Optional[Dict[str, str]] = None
+    timeLimit: Optional[int] = 30  # Time limit in seconds per question (default 30s)
 
 class Quiz(BaseModel):
     id: Optional[str] = None
