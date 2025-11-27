@@ -153,7 +153,7 @@ class GameController:
             logger.info(f"🎯 Single answer check: user={user_id}, answer={answer}, correct={correct_answer}, is_correct={is_correct}")
             
         elif question_type == "multiMcq":
-            # Multiple answer questions
+            # Multiple answer questions with partial credit
             correct_answers = question.get("correctAnswerIndices", [])
             if not correct_answers:
                 logger.error(f"❌ No correct answers found for multi-choice question {current_index}")
@@ -164,8 +164,35 @@ class GameController:
             user_answers_set = set(int(a) for a in user_answers)
             correct_answers_set = set(int(a) for a in correct_answers)
             
-            is_correct = user_answers_set == correct_answers_set
-            logger.info(f"🎯 Multi answer check: user={user_id}, answers={user_answers_set}, correct={correct_answers_set}, is_correct={is_correct}")
+            # Calculate partial credit
+            # Correct selections: +points per correct answer
+            # Wrong selections: -points per wrong answer
+            correct_selections = user_answers_set & correct_answers_set  # Intersection
+            wrong_selections = user_answers_set - correct_answers_set    # User selected but not correct
+            missed_selections = correct_answers_set - user_answers_set   # Correct but not selected
+            
+            total_correct = len(correct_answers_set)
+            num_correct = len(correct_selections)
+            num_wrong = len(wrong_selections)
+            
+            # Calculate partial credit percentage
+            # Each correct answer is worth (100 / total_correct)%
+            # Each wrong answer deducts (100 / total_correct)%
+            if total_correct > 0:
+                partial_credit = (num_correct - num_wrong) / total_correct
+                partial_credit = max(0.0, min(1.0, partial_credit))  # Clamp between 0 and 1
+            else:
+                partial_credit = 0.0
+            
+            is_correct = user_answers_set == correct_answers_set  # Full credit only if exact match
+            
+            logger.info(f"🎯 Multi answer check: user={user_id}")
+            logger.info(f"   User answers: {user_answers_set}")
+            logger.info(f"   Correct answers: {correct_answers_set}")
+            logger.info(f"   ✅ Correct selections: {num_correct}/{total_correct}")
+            logger.info(f"   ❌ Wrong selections: {num_wrong}")
+            logger.info(f"   ⚠️ Missed selections: {len(missed_selections)}")
+            logger.info(f"   📊 Partial credit: {partial_credit * 100:.1f}%")
             
         elif question_type == "dragAndDrop":
             # Drag and drop questions
@@ -189,12 +216,41 @@ class GameController:
         points = 0
         time_bonus = 0
         multiplier = 1.0
+        partial_credit_percentage = 0.0
         
         # Get per-question time limit
         question_time_limit = question.get('timeLimit', QUESTION_TIME_SECONDS)
         
-        if is_correct:
+        # For multi-choice, use partial credit
+        if question_type == "multiMcq" and 'partial_credit' in locals():
             base_points = 1000
+            
+            # Apply partial credit to base points
+            partial_points = int(base_points * partial_credit)
+            partial_credit_percentage = partial_credit * 100
+            
+            # Calculate time-based multiplier only if they got some points
+            if partial_credit > 0 and timestamp is not None and timestamp >= 0:
+                elapsed = min(timestamp, question_time_limit)
+                multiplier = max(1.0, 2.0 - (elapsed / question_time_limit))
+                time_bonus = int(partial_points * (multiplier - 1))
+            
+            points = partial_points + time_bonus
+            
+            if partial_credit == 1.0:
+                logger.info(f"✅ Perfect answer! Base: {base_points}, Time bonus: {time_bonus} (multiplier: {multiplier:.2f}x), Total: {points}")
+            elif partial_credit > 0:
+                logger.info(f"⚠️ Partial credit! Base: {base_points} × {partial_credit:.2f} = {partial_points}, Time bonus: {time_bonus}, Total: {points}")
+            else:
+                logger.info(f"❌ No points (wrong selections outweigh correct ones)")
+            
+            logger.info(f"⏱️ Time stats: elapsed={timestamp:.2f}s, limit={question_time_limit}s")
+            
+        elif is_correct:
+            # Full credit for other question types
+            base_points = 1000
+            partial_credit_percentage = 100.0
+            
             # Calculate time-based multiplier
             if timestamp is not None and timestamp >= 0:
                 # Clamp elapsed time to question's time limit
@@ -247,7 +303,7 @@ class GameController:
             # Store the answer for returning
             stored_answer = answer
             
-            return {
+            response = {
                 "is_correct": is_correct,
                 "points": points,
                 "time_bonus": time_bonus,
@@ -257,6 +313,13 @@ class GameController:
                 "new_total_score": participant["score"],
                 "question_type": question_type
             }
+            
+            # Add partial credit info for multi-choice
+            if question_type == "multiMcq":
+                response["partial_credit"] = round(partial_credit_percentage, 1)
+                response["is_partial"] = partial_credit_percentage > 0 and partial_credit_percentage < 100
+            
+            return response
             
         logger.error(f"❌ Participant {user_id} not found in session")
         return {"error": "Participant not found"}
