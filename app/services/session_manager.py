@@ -15,7 +15,8 @@ class SessionManager:
     def __init__(self):
         self.redis = redis_client
 
-    async def create_session(self, quiz_id: str, host_id: str, mode: str = "live") -> str:
+    async def create_session(self, quiz_id: str, host_id: str, mode: str = "live", 
+                            overall_time_limit: int = 0, per_question_time_limit: int = 30) -> str:
         """Create a new session and return the session code"""
         # Generate unique code
         session_code = await self._generate_unique_code()
@@ -37,7 +38,10 @@ class SessionManager:
             "expires_at": (datetime.utcnow() + timedelta(hours=SESSION_EXPIRY_HOURS)).isoformat(),
             "quiz_title": quiz.get("title", "Untitled Quiz"),
             "total_questions": len(quiz.get("questions", [])),
-            "participants": "{}"  # JSON string of participant dict
+            "participants": "{}",  # JSON string of participant dict
+            "overall_time_limit": overall_time_limit,  # 0 = no limit
+            "per_question_time_limit": per_question_time_limit,
+            "quiz_start_time": ""  # Will be set when quiz starts
         }
         
         # Store in Redis with expiration
@@ -134,7 +138,11 @@ class SessionManager:
         logger.info(f"✅ Setting session {session_code} status to 'active'")
         logger.info(f"📊 Session data: quiz_id={session.get('quiz_id')}, participants={len(session.get('participants', {}))}")
         
-        await self.redis.hset(f"session:{session_code}", "status", "active")
+        # Set status to active and record quiz start time
+        await self.redis.hset(f"session:{session_code}", mapping={
+            "status": "active",
+            "quiz_start_time": datetime.utcnow().isoformat()
+        })
         return True
 
     async def end_session(self, session_code: str) -> bool:

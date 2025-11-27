@@ -17,6 +17,8 @@ class CreateLiveSessionRequest(BaseModel):
     quiz_id: str
     host_id: str
     mode: str = "live"
+    overall_time_limit: Optional[int] = 0  # 0 = no limit, in seconds
+    per_question_time_limit: Optional[int] = 30  # Default 30 seconds per question
 
 
 class CreateLiveSessionResponse(BaseModel):
@@ -41,7 +43,9 @@ async def create_live_session(request: CreateLiveSessionRequest):
         session_code = await session_manager.create_session(
             quiz_id=request.quiz_id,
             host_id=request.host_id,
-            mode=request.mode
+            mode=request.mode,
+            overall_time_limit=request.overall_time_limit,
+            per_question_time_limit=request.per_question_time_limit
         )
         
         logger.info(f"Created live session {session_code} for quiz {request.quiz_id}")

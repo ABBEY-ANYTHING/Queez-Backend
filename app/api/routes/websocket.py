@@ -48,7 +48,7 @@ async def websocket_endpoint(websocket: WebSocket, session_code: str, user_id: s
                     await handle_join(websocket, session_code, user_id, payload)
                 
                 elif message_type == "start_quiz":
-                    await handle_start_quiz(websocket, session_code, user_id)
+                    await handle_start_quiz(websocket, session_code, user_id, payload)
                 
                 elif message_type == "submit_answer":
                     logger.info(f"📝 Processing submit_answer from {user_id}")
@@ -193,7 +193,7 @@ async def handle_join(websocket: WebSocket, session_code: str, user_id: str, pay
         logger.error(f"❌ Failed to add {username} (ID: {user_id}) to session {session_code}")
 
 
-async def handle_start_quiz(websocket: WebSocket, session_code: str, user_id: str):
+async def handle_start_quiz(websocket: WebSocket, session_code: str, user_id: str, payload: dict = None):
     """Host starts the quiz"""
     is_host = await session_manager.is_host(session_code, user_id)
     
@@ -203,6 +203,19 @@ async def handle_start_quiz(websocket: WebSocket, session_code: str, user_id: st
             "payload": {"message": "Only host can start the quiz"}
         }, websocket)
         return
+    
+    # Extract time settings from payload
+    if payload:
+        overall_time_limit = payload.get('overall_time_limit', 0)
+        per_question_time_limit = payload.get('per_question_time_limit', 30)
+        
+        # Update session with time settings
+        from app.core.database import redis_client
+        await redis_client.hset(f"session:{session_code}", mapping={
+            "overall_time_limit": overall_time_limit,
+            "per_question_time_limit": per_question_time_limit
+        })
+        logger.info(f"⏱️ Updated time settings: overall={overall_time_limit}s, per_question={per_question_time_limit}s")
     
     # Start the quiz - update session status
     success = await session_manager.start_session(session_code, user_id)
@@ -234,10 +247,18 @@ async def handle_start_quiz(websocket: WebSocket, session_code: str, user_id: st
         }, websocket)
         return
     
-    # Broadcast quiz started to all participants
+    # Get time settings for the quiz_started payload
+    overall_time_limit = int(session.get("overall_time_limit", 0))
+    per_question_time_limit = int(session.get("per_question_time_limit", 30))
+    
+    # Broadcast quiz started to all participants with time settings
     await manager.broadcast_to_session({
         "type": "quiz_started",
-        "payload": {"message": "Quiz is starting!"}
+        "payload": {
+            "message": "Quiz is starting!",
+            "overall_time_limit": overall_time_limit,
+            "per_question_time_limit": per_question_time_limit
+        }
     }, session_code)
     
     # Send first question to all participants

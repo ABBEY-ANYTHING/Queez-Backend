@@ -389,8 +389,12 @@ class GameController:
         
         logger.info(f"📚 Getting question {index} for session {session_code}")
         
-        # Get quiz ID
-        quiz_id = await self.redis.hget(session_key, "quiz_id")
+        # Get quiz ID and session time settings
+        session_data = await self.redis.hmget(session_key, ["quiz_id", "per_question_time_limit", "overall_time_limit", "quiz_start_time"])
+        quiz_id = session_data[0]
+        session_per_question_limit = int(session_data[1]) if session_data[1] else QUESTION_TIME_SECONDS
+        overall_time_limit = int(session_data[2]) if session_data[2] else 0
+        quiz_start_time = session_data[3]
         
         if not quiz_id:
             logger.error(f"❌ Quiz ID not found for session {session_code}")
@@ -421,8 +425,14 @@ class GameController:
         
         logger.info(f"✅ Retrieved question {index + 1}/{len(questions)}: {question_text[:50]}...")
         
-        # Get per-question time limit
-        question_time_limit = question.get('timeLimit', QUESTION_TIME_SECONDS)
+        # Use session's per-question time limit (set by host)
+        question_time_limit = session_per_question_limit
+        
+        # Calculate overall time remaining
+        overall_time_remaining = 0
+        if overall_time_limit > 0 and quiz_start_time:
+            elapsed = (datetime.utcnow() - datetime.fromisoformat(quiz_start_time)).total_seconds()
+            overall_time_remaining = max(0, overall_time_limit - int(elapsed))
         
         # Build question payload
         question_payload = {
@@ -453,5 +463,7 @@ class GameController:
             "index": index,
             "total": len(questions),
             "time_remaining": question_time_limit,
-            "time_limit": question_time_limit
+            "time_limit": question_time_limit,
+            "overall_time_limit": overall_time_limit,
+            "overall_time_remaining": overall_time_remaining
         }
