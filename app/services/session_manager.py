@@ -1,9 +1,11 @@
 import json
 import logging
+import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
 import random
 import string
+import redis.asyncio as redis
 
 from app.core.database import redis_client, collection as quiz_collection, results_collection
 from app.core.config import SESSION_EXPIRY_HOURS
@@ -75,8 +77,9 @@ class SessionManager:
         return session_data
 
     async def add_participant(self, session_code: str, user_id: str, username: str) -> bool:
-        """Add a participant to the session (excluding host)"""
+        """Add a participant to the session (excluding host) - with distributed lock for race conditions"""
         session_key = f"session:{session_code}"
+        lock_key = f"lock:session:{session_code}:participants"
         
         # Check if user is the host - hosts should NOT be in participant list
         host_id = await self.redis.hget(session_key, "host_id")
@@ -84,31 +87,75 @@ class SessionManager:
             logger.info(f"Rejected participant join: {user_id} is the host of session {session_code}")
             return False
         
-        # Get current participants
-        participants_json = await self.redis.hget(session_key, "participants")
-        if not participants_json:
-            return False
-            
-        participants = json.loads(participants_json)
+        # Acquire distributed lock with retry
+        max_retries = 20
+        lock_timeout = 5  # Lock expires after 5 seconds
         
-        # Add or update participant
-        if user_id in participants:
-            # Reconnecting user - preserve state
-            participants[user_id]["connected"] = True
-            participants[user_id]["username"] = username # Update username just in case
-        else:
-            # New participant
-            participants[user_id] = {
-                "user_id": user_id,
-                "username": username,
-                "joined_at": datetime.utcnow().isoformat(),
-                "connected": True,
-                "score": 0,
-                "answers": []
-            }
+        for attempt in range(max_retries):
+            try:
+                # Try to acquire lock using SETNX (SET if Not eXists)
+                lock_acquired = await self.redis.set(
+                    lock_key, 
+                    user_id, 
+                    nx=True,  # Only set if not exists
+                    ex=lock_timeout  # Expire after 5 seconds
+                )
+                
+                if not lock_acquired:
+                    # Lock held by another process, wait and retry
+                    await asyncio.sleep(0.05 + (0.02 * attempt))  # 50ms + backoff
+                    continue
+                
+                try:
+                    # We have the lock - safely read and update participants
+                    participants_json = await self.redis.hget(session_key, "participants")
+                    if not participants_json:
+                        logger.error(f"Session {session_code} not found or has no participants field")
+                        return False
+                    
+                    participants = json.loads(participants_json)
+                    
+                    # Add or update participant
+                    if user_id in participants:
+                        # Reconnecting user - preserve state
+                        participants[user_id]["connected"] = True
+                        participants[user_id]["username"] = username
+                        logger.info(f"🔄 Reconnecting participant {username} ({user_id}) to session {session_code}")
+                    else:
+                        # New participant
+                        participants[user_id] = {
+                            "user_id": user_id,
+                            "username": username,
+                            "joined_at": datetime.utcnow().isoformat(),
+                            "connected": True,
+                            "score": 0,
+                            "answers": []
+                        }
+                        logger.info(f"🆕 Adding NEW participant {username} ({user_id}) to session {session_code}")
+                    
+                    # Save updated participants
+                    await self.redis.hset(session_key, "participants", json.dumps(participants))
+                    logger.info(f"✅ Successfully added {username} to session {session_code} (total: {len(participants)} participants)")
+                    return True
+                    
+                finally:
+                    # Always release the lock
+                    await self.redis.delete(lock_key)
+                    
+            except Exception as e:
+                logger.error(f"❌ Error adding participant {user_id} (attempt {attempt + 1}): {e}")
+                # Try to release lock in case of error
+                try:
+                    await self.redis.delete(lock_key)
+                except:
+                    pass
+                if attempt == max_retries - 1:
+                    return False
+                await asyncio.sleep(0.05 * (attempt + 1))
+                continue
         
-        await self.redis.hset(session_key, "participants", json.dumps(participants))
-        return True
+        logger.error(f"❌ Failed to add participant {user_id} after {max_retries} attempts (could not acquire lock)")
+        return False
 
     async def remove_participant(self, session_code: str, user_id: str):
         """Mark participant as disconnected"""

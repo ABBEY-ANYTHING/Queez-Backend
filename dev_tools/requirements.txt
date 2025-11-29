@@ -1,0 +1,2 @@
+# Dev Tools Dependencies
+websockets>=11.0
