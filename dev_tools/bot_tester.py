@@ -79,10 +79,14 @@ class QuizBot:
     
     async def _send_message(self, msg_type: str, payload: dict = None):
         if self.websocket and self.is_connected:
-            message = {"type": msg_type}
-            if payload:
-                message["payload"] = payload
-            await self.websocket.send(json.dumps(message))
+            try:
+                message = {"type": msg_type}
+                if payload:
+                    message["payload"] = payload
+                await self.websocket.send(json.dumps(message))
+            except Exception as e:
+                self.is_connected = False
+                self._log(f"⚠️ Send failed: {e}")
     
     def _get_answer(self, question: dict) -> Any:
         question_type = question.get("type") or question.get("questionType", "singleMcq")
@@ -111,7 +115,7 @@ class QuizBot:
     
     async def submit_answer(self):
         """Submit answer for current question"""
-        if not self.current_question:
+        if not self.current_question or not self.is_connected or self.quiz_completed:
             return
             
         question = self.current_question.get("question", {})
@@ -131,7 +135,8 @@ class QuizBot:
     
     async def request_next(self):
         """Request next question"""
-        await self._send_message("request_next_question", {})
+        if self.is_connected and not self.quiz_completed:
+            await self._send_message("request_next_question", {})
     
     async def listen_loop(self):
         """Listen for messages"""
@@ -181,7 +186,10 @@ class QuizBot:
     
     async def disconnect(self):
         if self.websocket:
-            await self.websocket.close()
+            try:
+                await self.websocket.close()
+            except:
+                pass
             self._log("👋 Disconnected")
 
 
@@ -233,39 +241,49 @@ async def run_bots(session_code: str, num_bots: int, batch_size: int = 10, batch
     print("\n🎮 QUIZ IN PROGRESS - All bots answering together\n")
     
     # Main quiz loop - all bots answer together
-    while True:
-        # Check if all bots completed
-        if all(b.quiz_completed for b in connected_bots):
+    max_rounds = 50  # Safety limit
+    round_count = 0
+    
+    while round_count < max_rounds:
+        round_count += 1
+        
+        # Check if all bots completed or disconnected
+        active_connected = [b for b in connected_bots if b.is_connected and not b.quiz_completed]
+        if not active_connected:
+            print("✅ All bots completed or disconnected")
             break
         
-        # Get bots that have a question and haven't completed
-        active_bots = [b for b in connected_bots if b.current_question and not b.quiz_completed]
+        # Get bots that have a question and are ready to answer
+        ready_bots = [b for b in active_connected if b.current_question]
         
-        if not active_bots:
+        if not ready_bots:
             await asyncio.sleep(0.5)
             continue
         
-        # All active bots submit answers together
-        print(f"📤 {len(active_bots)} bots answering...")
-        await asyncio.gather(*[b.submit_answer() for b in active_bots])
+        # All ready bots submit answers together
+        print(f"📤 {len(ready_bots)} bots answering...")
+        await asyncio.gather(*[b.submit_answer() for b in ready_bots], return_exceptions=True)
         
-        # Wait for all results
-        timeout = 10
-        while any(b.waiting_for_result for b in active_bots) and timeout > 0:
-            await asyncio.sleep(0.2)
-            timeout -= 0.2
+        # Wait for results (with timeout)
+        timeout = 15
+        while timeout > 0:
+            waiting = [b for b in ready_bots if b.waiting_for_result and b.is_connected]
+            if not waiting:
+                break
+            await asyncio.sleep(0.3)
+            timeout -= 0.3
         
         # Delay between questions
         await asyncio.sleep(QUESTION_DELAY)
         
-        # All bots request next question together
-        non_completed = [b for b in connected_bots if not b.quiz_completed]
+        # All non-completed bots request next question together
+        non_completed = [b for b in connected_bots if b.is_connected and not b.quiz_completed]
         if non_completed:
             print(f"➡️ {len(non_completed)} bots requesting next question...")
-            await asyncio.gather(*[b.request_next() for b in non_completed])
+            await asyncio.gather(*[b.request_next() for b in non_completed], return_exceptions=True)
         
         # Wait for questions to arrive
-        await asyncio.sleep(1)
+        await asyncio.sleep(1.5)
     
     # All done - wait 15 seconds
     print("\n" + "="*60)
