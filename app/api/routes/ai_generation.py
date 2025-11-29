@@ -218,51 +218,47 @@ REQUIREMENTS:
 
 OUTPUT FORMAT (JSON):
 {{
-  "studySet": {{
-    "name": "{request.config.name}",
-    "description": "{request.config.description}",
-    "category": "{request.config.category}",
-    "language": "{request.config.language}",
-    "coverImage": null,
-    "quizzes": [
-      {{
-        "title": "Quiz title",
-        "description": "Quiz description",
-        "difficulty": "Easy|Medium|Hard",
-        "questions": [
-          {{
-            "questionText": "Question text",
-            "options": ["Option A", "Option B", "Option C", "Option D"],
-            "correctOption": 0,
-            "explanation": "Why this is correct"
-          }}
-        ]
-      }}
-    ],
-    "flashcardSets": [
-      {{
-        "title": "Flashcard set title",
-        "description": "Set description",
-        "cards": [
-          {{
-            "front": "Term or question",
-            "back": "Definition or answer",
-            "hint": "Optional hint"
-          }}
-        ]
-      }}
-    ],
-    "notes": [
-      {{
-        "title": "Note title",
-        "content": "Comprehensive note content with formatting",
-        "summary": "Brief summary"
-      }}
-    ]
-  }}
+  "quizzes": [
+    {{
+      "title": "Quiz title",
+      "description": "Quiz description",
+      "difficulty": "Easy|Medium|Hard",
+      "category": "{request.config.category}",
+      "language": "{request.config.language}",
+      "questions": [
+        {{
+          "questionText": "Question text",
+          "options": ["Option A", "Option B", "Option C", "Option D"],
+          "correctOption": 0,
+          "explanation": "Why this is correct"
+        }}
+      ]
+    }}
+  ],
+  "flashcardSets": [
+    {{
+      "title": "Flashcard set title",
+      "description": "Set description",
+      "category": "{request.config.category}",
+      "cards": [
+        {{
+          "front": "Term or question",
+          "back": "Definition or answer"
+        }}
+      ]
+    }}
+  ],
+  "notes": [
+    {{
+      "title": "Note title",
+      "description": "Brief summary",
+      "category": "{request.config.category}",
+      "content": "{{\\"ops\\":[{{\\"insert\\":\\"Note content in Quill Delta format\\\\n\\"}}]}}"
+    }}
+  ]
 }}
 
-Generate the study set now based on the documents provided."""
+IMPORTANT: Return ONLY valid JSON without any markdown formatting or code blocks. The JSON should be parseable directly."""
 
         # Send request to Gemini with file objects
         content_parts = [prompt] + files
@@ -279,6 +275,9 @@ Generate the study set now based on the documents provided."""
         
         # Parse response
         import json
+        import uuid
+        from datetime import datetime
+        
         response_text = response.text
         
         # Extract JSON from markdown code blocks if present
@@ -291,14 +290,123 @@ Generate the study set now based on the documents provided."""
             end = response_text.find("```", start)
             response_text = response_text[start:end].strip()
         
-        study_set_data = json.loads(response_text)
+        ai_response = json.loads(response_text)
+        
+        # Get Firebase user ID from token
+        import firebase_admin
+        from firebase_admin import auth as firebase_auth
+        
+        # Verify the Firebase token
+        try:
+            token = authorization.replace("Bearer ", "")
+            decoded_token = firebase_auth.verify_id_token(token)
+            user_id = decoded_token['uid']
+        except Exception as e:
+            logger.error(f"Token verification failed: {str(e)}")
+            raise HTTPException(status_code=401, detail="Invalid authentication token")
+        
+        # Build the complete study set structure
+        current_time = datetime.utcnow().isoformat() + "Z"
+        study_set_id = str(uuid.uuid4())
+        
+        # Process quizzes
+        quizzes = []
+        for quiz_data in ai_response.get("quizzes", []):
+            quiz_id = str(uuid.uuid4())
+            questions = []
+            for q_data in quiz_data.get("questions", []):
+                question = {
+                    "id": str(uuid.uuid4()),
+                    "questionText": q_data.get("questionText", ""),
+                    "options": q_data.get("options", []),
+                    "correctOption": q_data.get("correctOption", 0),
+                    "explanation": q_data.get("explanation", "")
+                }
+                questions.append(question)
+            
+            quiz = {
+                "id": quiz_id,
+                "title": quiz_data.get("title", f"Quiz {len(quizzes) + 1}"),
+                "description": quiz_data.get("description", ""),
+                "category": quiz_data.get("category", request.config.category),
+                "language": quiz_data.get("language", request.config.language),
+                "difficulty": quiz_data.get("difficulty", request.settings.difficulty),
+                "creatorId": user_id,
+                "questions": questions,
+                "createdAt": current_time
+            }
+            quizzes.append(quiz)
+        
+        # Process flashcard sets
+        flashcard_sets = []
+        for set_data in ai_response.get("flashcardSets", []):
+            set_id = str(uuid.uuid4())
+            cards = []
+            for card_data in set_data.get("cards", []):
+                card = {
+                    "id": str(uuid.uuid4()),
+                    "front": card_data.get("front", ""),
+                    "back": card_data.get("back", "")
+                }
+                cards.append(card)
+            
+            flashcard_set = {
+                "id": set_id,
+                "title": set_data.get("title", f"Flashcard Set {len(flashcard_sets) + 1}"),
+                "description": set_data.get("description", ""),
+                "category": set_data.get("category", request.config.category),
+                "creatorId": user_id,
+                "cards": cards,
+                "createdAt": current_time
+            }
+            flashcard_sets.append(flashcard_set)
+        
+        # Process notes
+        notes = []
+        for note_data in ai_response.get("notes", []):
+            note_id = str(uuid.uuid4())
+            
+            # Convert content to Quill Delta format if it's plain text
+            content = note_data.get("content", "")
+            if isinstance(content, str):
+                # Simple conversion to Quill Delta
+                content = {"ops": [{"insert": content + "\\n"}]}
+            
+            note = {
+                "id": note_id,
+                "title": note_data.get("title", f"Note {len(notes) + 1}"),
+                "description": note_data.get("description", note_data.get("summary", "")),
+                "category": note_data.get("category", request.config.category),
+                "content": json.dumps(content) if isinstance(content, dict) else content,
+                "creatorId": user_id,
+                "createdAt": current_time,
+                "updatedAt": current_time
+            }
+            notes.append(note)
+        
+        # Build final study set
+        study_set = {
+            "id": study_set_id,
+            "name": request.config.name,
+            "description": request.config.description,
+            "category": request.config.category,
+            "language": request.config.language,
+            "coverImagePath": request.config.coverImagePath,
+            "creatorId": user_id,
+            "quizzes": quizzes,
+            "flashcardSets": flashcard_sets,
+            "notes": notes,
+            "createdAt": current_time,
+            "updatedAt": current_time
+        }
         
         logger.info(f"Successfully generated study set: {request.config.name}")
+        logger.info(f"Quizzes: {len(quizzes)}, Flashcard Sets: {len(flashcard_sets)}, Notes: {len(notes)}")
         
         # Return the generated study set
         return {
             "success": True,
-            "studySet": study_set_data.get("studySet", study_set_data)
+            "studySet": study_set
         }
     
     except HTTPException:
