@@ -5,6 +5,8 @@ from datetime import datetime, timedelta
 import secrets
 import os
 import logging
+import json
+import uuid
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -164,8 +166,8 @@ async def generate_study_set(
         
         genai.configure(api_key=api_key)
         
-        # Initialize Gemini model
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        # Initialize Gemini model (using 1.5-flash for better rate limits)
+        model = genai.GenerativeModel('gemini-1.5-flash')
         
         logger.info(f"Generating AI study set from {len(request.fileUris)} files")
         logger.info(f"Settings: {request.settings.quizCount} quizzes, {request.settings.flashcardSetCount} flashcard sets, {request.settings.noteCount} notes")
