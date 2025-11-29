@@ -43,7 +43,7 @@ class UploadUrlRequest(BaseModel):
 
 class GenerateStudySetRequest(BaseModel):
     fileUris: List[str]
-    config: StudySetConfig
+    config: Optional[StudySetConfig] = None
     settings: GenerationSettings
 
 @router.post("/get-upload-url")
@@ -143,13 +143,6 @@ async def generate_study_set(
         if len(request.fileUris) > 3:
             raise HTTPException(status_code=400, detail="Maximum 3 files allowed")
         
-        # Validate config
-        if not request.config.name or len(request.config.name) < 3:
-            raise HTTPException(status_code=400, detail="Name must be at least 3 characters")
-        
-        if not request.config.description or len(request.config.description) < 10:
-            raise HTTPException(status_code=400, detail="Description must be at least 10 characters")
-        
         # Import Gemini SDK
         try:
             import google.generativeai as genai
@@ -174,9 +167,9 @@ async def generate_study_set(
         # Initialize Gemini model
         model = genai.GenerativeModel('gemini-2.0-flash-exp')
         
-        logger.info(f"Generating study set from {len(request.fileUris)} files")
-        logger.info(f"Config: {request.config.name} - {request.config.category}")
-        logger.info(f"Settings: {request.settings.quizCount} quizzes, {request.settings.flashcardSetCount} flashcard sets")
+        logger.info(f"Generating AI study set from {len(request.fileUris)} files")
+        logger.info(f"Settings: {request.settings.quizCount} quizzes, {request.settings.flashcardSetCount} flashcard sets, {request.settings.noteCount} notes")
+        logger.info(f"Difficulty: {request.settings.difficulty}")
         
         # Get file objects from URIs
         files = []
@@ -194,37 +187,41 @@ async def generate_study_set(
             raise HTTPException(status_code=400, detail="Could not load any files")
         
         # Build the prompt
-        prompt = f"""You are an expert educator creating study materials. Analyze the provided documents and generate a comprehensive study set.
-
-STUDY SET DETAILS:
-- Name: {request.config.name}
-- Description: {request.config.description}
-- Category: {request.config.category}
-- Language: {request.config.language}
-- Difficulty: {request.settings.difficulty}
+        prompt = f"""You are an expert educator creating study materials. Analyze the provided documents and generate a comprehensive study set with ALL metadata.
 
 GENERATE THE FOLLOWING:
-1. {request.settings.quizCount} quizzes with {request.settings.questionsPerQuiz} multiple-choice questions each
-2. {request.settings.flashcardSetCount} flashcard sets with {request.settings.cardsPerSet} cards each
-3. {request.settings.noteCount} comprehensive study notes
+1. Study Set Metadata (name, description, category, language)
+2. {request.settings.quizCount} quizzes with {request.settings.questionsPerQuiz} multiple-choice questions each (each quiz has its own title, description, difficulty, category, language)
+3. {request.settings.flashcardSetCount} flashcard sets with {request.settings.cardsPerSet} cards each (each set has its own title, description, category)
+4. {request.settings.noteCount} comprehensive study notes (each note has its own title, description, category)
 
 REQUIREMENTS:
-- Extract key concepts, definitions, and important facts from the documents
+- Analyze the document(s) and create an appropriate study set name and description
+- Determine the appropriate category (Science, Math, History, Language, Technology, Business, Arts, Health, Engineering, Social Studies, Philosophy, Psychology, Geography, Literature, Music, Sports, Law, Economics, Politics, Other)
+- Detect the language of the content
+- Extract key concepts, definitions, and important facts
 - Create questions that test understanding, not just memorization
 - Ensure flashcards cover different aspects of the material
 - Notes should summarize main topics with examples
 - Use proper formatting and clear language
-- Match the specified difficulty level
+- Match difficulty level: {request.settings.difficulty}
+- Each quiz, flashcard set, and note should have its own unique title, description, category, and language
 
 OUTPUT FORMAT (JSON):
 {{
+  "studySet": {{
+    "name": "Generated study set name based on document content",
+    "description": "Comprehensive description of what this study set covers",
+    "category": "Most appropriate category from the list above",
+    "language": "Detected language (English, Spanish, French, etc.)"
+  }},
   "quizzes": [
     {{
-      "title": "Quiz title",
-      "description": "Quiz description",
+      "title": "Unique quiz title (e.g., 'Chapter 1: Introduction to Biology')",
+      "description": "What this specific quiz covers",
       "difficulty": "Easy|Medium|Hard",
-      "category": "{request.config.category}",
-      "language": "{request.config.language}",
+      "category": "Category for this quiz",
+      "language": "Language for this quiz",
       "questions": [
         {{
           "questionText": "Question text",
@@ -237,9 +234,9 @@ OUTPUT FORMAT (JSON):
   ],
   "flashcardSets": [
     {{
-      "title": "Flashcard set title",
-      "description": "Set description",
-      "category": "{request.config.category}",
+      "title": "Unique flashcard set title (e.g., 'Key Terms: Cell Biology')",
+      "description": "What this flashcard set focuses on",
+      "category": "Category for this set",
       "cards": [
         {{
           "front": "Term or question",
@@ -250,9 +247,9 @@ OUTPUT FORMAT (JSON):
   ],
   "notes": [
     {{
-      "title": "Note title",
-      "description": "Brief summary",
-      "category": "{request.config.category}",
+      "title": "Unique note title (e.g., 'Summary: Cellular Processes')",
+      "description": "Brief summary of note content",
+      "category": "Category for this note",
       "content": "{{\\"ops\\":[{{\\"insert\\":\\"Note content in Quill Delta format\\\\n\\"}}]}}"
     }}
   ]
@@ -292,6 +289,9 @@ IMPORTANT: Return ONLY valid JSON without any markdown formatting or code blocks
         
         ai_response = json.loads(response_text)
         
+        # Extract study set metadata from AI response
+        study_set_metadata = ai_response.get("studySet", {})
+        
         # Get Firebase user ID from token
         import firebase_admin
         from firebase_admin import auth as firebase_auth
@@ -328,8 +328,8 @@ IMPORTANT: Return ONLY valid JSON without any markdown formatting or code blocks
                 "id": quiz_id,
                 "title": quiz_data.get("title", f"Quiz {len(quizzes) + 1}"),
                 "description": quiz_data.get("description", ""),
-                "category": quiz_data.get("category", request.config.category),
-                "language": quiz_data.get("language", request.config.language),
+                "category": quiz_data.get("category", study_set_metadata.get("category", "Other")),
+                "language": quiz_data.get("language", study_set_metadata.get("language", "English")),
                 "difficulty": quiz_data.get("difficulty", request.settings.difficulty),
                 "creatorId": user_id,
                 "questions": questions,
@@ -354,7 +354,7 @@ IMPORTANT: Return ONLY valid JSON without any markdown formatting or code blocks
                 "id": set_id,
                 "title": set_data.get("title", f"Flashcard Set {len(flashcard_sets) + 1}"),
                 "description": set_data.get("description", ""),
-                "category": set_data.get("category", request.config.category),
+                "category": set_data.get("category", study_set_metadata.get("category", "Other")),
                 "creatorId": user_id,
                 "cards": cards,
                 "createdAt": current_time
@@ -376,7 +376,7 @@ IMPORTANT: Return ONLY valid JSON without any markdown formatting or code blocks
                 "id": note_id,
                 "title": note_data.get("title", f"Note {len(notes) + 1}"),
                 "description": note_data.get("description", note_data.get("summary", "")),
-                "category": note_data.get("category", request.config.category),
+                "category": note_data.get("category", study_set_metadata.get("category", "Other")),
                 "content": json.dumps(content) if isinstance(content, dict) else content,
                 "creatorId": user_id,
                 "createdAt": current_time,
@@ -384,14 +384,14 @@ IMPORTANT: Return ONLY valid JSON without any markdown formatting or code blocks
             }
             notes.append(note)
         
-        # Build final study set
+        # Build final study set with AI-generated metadata
         study_set = {
             "id": study_set_id,
-            "name": request.config.name,
-            "description": request.config.description,
-            "category": request.config.category,
-            "language": request.config.language,
-            "coverImagePath": request.config.coverImagePath,
+            "name": study_set_metadata.get("name", "AI Generated Study Set"),
+            "description": study_set_metadata.get("description", "Study materials generated from uploaded documents"),
+            "category": study_set_metadata.get("category", "Other"),
+            "language": study_set_metadata.get("language", "English"),
+            "coverImagePath": None,
             "creatorId": user_id,
             "quizzes": quizzes,
             "flashcardSets": flashcard_sets,
