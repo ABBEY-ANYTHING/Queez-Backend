@@ -482,7 +482,14 @@ class GameController:
         index = await self.redis.get(participant_key)
         
         if index is not None:
-            return int(index)
+            # Handle edge case where Redis might return bytes or unexpected types
+            if isinstance(index, bytes):
+                index = index.decode('utf-8')
+            if isinstance(index, (str, int, float)):
+                return int(index)
+            # If it's a list or other type, log and return 0
+            logger.warning(f"Unexpected index type for {user_id}: {type(index)} = {index}")
+            return 0
         
         # Not initialized yet - default to 0
         # This should only happen if they joined before quiz started

@@ -50,7 +50,7 @@ class ConnectionManager:
             if session_code in self.session_connections:
                 if user_id in self.session_connections[session_code]:
                     del self.session_connections[session_code][user_id]
-                    logger.info(f"👋 User {user_id} disconnected from session {session_code}")
+                    logger.info(f"User {user_id} disconnected from session {session_code}")
                 
                 # Clean up empty sessions
                 if not self.session_connections[session_code]:

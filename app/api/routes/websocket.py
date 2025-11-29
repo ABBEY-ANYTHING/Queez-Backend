@@ -315,6 +315,16 @@ async def handle_start_quiz(websocket: WebSocket, session_code: str, user_id: st
 async def handle_submit_answer(websocket: WebSocket, session_code: str, user_id: str, payload: dict):
     """Participant submits an answer"""
     try:
+        # Check if user is host - hosts cannot participate
+        is_host = await session_manager.is_host(session_code, user_id)
+        if is_host:
+            logger.debug(f"Host {user_id} tried to submit answer - ignoring")
+            await manager.send_personal_message({
+                "type": "error",
+                "payload": {"message": "Host cannot participate in quiz"}
+            }, websocket)
+            return
+        
         answer = payload.get("answer")
         timestamp = payload.get("timestamp", datetime.utcnow().timestamp())
         is_timeout = payload.get("timeout", False)
@@ -415,6 +425,11 @@ async def handle_request_next_question(websocket: WebSocket, session_code: str, 
     So we just need to fetch the question at their current index.
     """
     try:
+        # Check if user is host - hosts don't participate
+        is_host = await session_manager.is_host(session_code, user_id)
+        if is_host:
+            return  # Silently ignore host requests for questions
+        
         # Get participant's current index (already advanced after answering)
         current_index = await game_controller.get_participant_question_index(session_code, user_id)
         total_questions = await game_controller.get_total_questions(session_code)
