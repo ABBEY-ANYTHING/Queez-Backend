@@ -8,3 +8,4 @@ python-dotenv
 redis
 websockets
 python-socketio
+google-generativeai
