@@ -366,29 +366,14 @@ async def handle_submit_answer(websocket: WebSocket, session_code: str, user_id:
             "payload": result
         }, websocket)
         
-        # ✅ GET AND BROADCAST REAL-TIME LEADERBOARD (debounced for performance)
-        # Only broadcast every few answers to reduce load
-        session = await session_manager.get_session(session_code)
-        participants = session.get("participants", {}) if session else {}
-        participant_count = len(participants)
-        
-        # For large sessions (20+), only broadcast leaderboard every 5 answers
-        should_broadcast_leaderboard = True
-        if participant_count >= 20:
-            # Count how many have answered current question
-            answered_count = sum(
-                1 for p in participants.values() 
-                if any(a.get("question_index") == result.get("question_index", 0) for a in p.get("answers", []))
-            )
-            should_broadcast_leaderboard = answered_count % 5 == 0 or answered_count == participant_count
-        
-        if should_broadcast_leaderboard:
-            leaderboard = await leaderboard_manager.get_leaderboard(session_code)
-            await manager.broadcast_to_session({
-                "type": "leaderboard_update",
-                "payload": {"leaderboard": leaderboard}
-            }, session_code)
-            logger.debug(f"🏆 LEADERBOARD - Broadcasted to session {session_code}")
+        # ✅ ALWAYS broadcast leaderboard after each answer
+        # This ensures the host sees real-time progress
+        leaderboard = await leaderboard_manager.get_leaderboard(session_code)
+        await manager.broadcast_to_session({
+            "type": "leaderboard_update",
+            "payload": {"leaderboard": leaderboard}
+        }, session_code)
+        logger.debug(f"🏆 LEADERBOARD - Broadcasted to session {session_code}")
     
     except Exception as e:
         logger.error(f"❌ ANSWER - Error processing answer for {user_id}: {e}", exc_info=True)
