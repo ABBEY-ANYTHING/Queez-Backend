@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 import json
@@ -105,13 +106,55 @@ class GameController:
         }
 
     async def submit_answer(self, session_code: str, user_id: str, answer: Any, timestamp: float) -> Dict[str, Any]:
-        """Process a participant's answer"""
+        """Process a participant's answer with distributed locking to prevent race conditions"""
+        session_key = f"session:{session_code}"
+        answer_lock_key = f"lock:answer:{session_code}:{user_id}"
+        
+        # Acquire distributed lock for this specific user's answer submission
+        max_retries = 20
+        lock_timeout = 5
+        
+        for attempt in range(max_retries):
+            try:
+                # Try to acquire lock
+                lock_acquired = await self.redis.set(
+                    answer_lock_key,
+                    "1",
+                    nx=True,
+                    ex=lock_timeout
+                )
+                
+                if not lock_acquired:
+                    # Lock held by another process, wait and retry
+                    await asyncio.sleep(0.05 * (attempt + 1))
+                    continue
+                
+                try:
+                    return await self._process_answer_internal(session_code, user_id, answer, timestamp)
+                finally:
+                    # Always release the lock
+                    await self.redis.delete(answer_lock_key)
+                    
+            except Exception as e:
+                logger.error(f"❌ Answer submission error for {user_id} (attempt {attempt + 1}): {e}")
+                try:
+                    await self.redis.delete(answer_lock_key)
+                except:
+                    pass
+                if attempt == max_retries - 1:
+                    return {"error": "Failed to process answer, please try again"}
+                await asyncio.sleep(0.05)
+        
+        return {"error": "Failed to process answer after multiple attempts"}
+
+    async def _process_answer_internal(self, session_code: str, user_id: str, answer: Any, timestamp: float) -> Dict[str, Any]:
+        """Internal answer processing (called with lock held)"""
         session_key = f"session:{session_code}"
         
         # Get participant's current question index
         current_index = await self.get_participant_question_index(session_code, user_id)
         
-        logger.info(f"📝 Processing answer for user {user_id} on question {current_index}")
+        logger.debug(f"📝 Processing answer for user {user_id} on question {current_index}")
         
         # Get session state
         session_data = await self.redis.hmget(session_key, ["quiz_id", "participants"])
@@ -133,14 +176,12 @@ class GameController:
         question = quiz["questions"][current_index]
         question_type = question.get("type", "singleMcq")
         
-        logger.info(f"📝 Question type: {question_type}")
-        
         # Handle different question types
         is_correct = False
         
         # Handle timeout (null answer)
         if answer is None:
-            logger.info(f"⏰ Timeout - user {user_id} did not answer in time")
+            logger.debug(f"⏰ Timeout - user {user_id} did not answer in time")
             is_correct = False
         elif question_type in ["singleMcq", "trueFalse"]:
             # Single answer questions
@@ -150,7 +191,6 @@ class GameController:
                 return {"error": "Invalid question configuration"}
             
             is_correct = int(answer) == int(correct_answer)
-            logger.info(f"🎯 Single answer check: user={user_id}, answer={answer}, correct={correct_answer}, is_correct={is_correct}")
             
         elif question_type == "multiMcq":
             # Multiple answer questions with partial credit
@@ -165,34 +205,20 @@ class GameController:
             correct_answers_set = set(int(a) for a in correct_answers)
             
             # Calculate partial credit
-            # Correct selections: +points per correct answer
-            # Wrong selections: -points per wrong answer
-            correct_selections = user_answers_set & correct_answers_set  # Intersection
-            wrong_selections = user_answers_set - correct_answers_set    # User selected but not correct
-            missed_selections = correct_answers_set - user_answers_set   # Correct but not selected
+            correct_selections = user_answers_set & correct_answers_set
+            wrong_selections = user_answers_set - correct_answers_set
             
             total_correct = len(correct_answers_set)
             num_correct = len(correct_selections)
             num_wrong = len(wrong_selections)
             
-            # Calculate partial credit percentage
-            # Each correct answer is worth (100 / total_correct)%
-            # Each wrong answer deducts (100 / total_correct)%
             if total_correct > 0:
                 partial_credit = (num_correct - num_wrong) / total_correct
-                partial_credit = max(0.0, min(1.0, partial_credit))  # Clamp between 0 and 1
+                partial_credit = max(0.0, min(1.0, partial_credit))
             else:
                 partial_credit = 0.0
             
-            is_correct = user_answers_set == correct_answers_set  # Full credit only if exact match
-            
-            logger.info(f"🎯 Multi answer check: user={user_id}")
-            logger.info(f"   User answers: {user_answers_set}")
-            logger.info(f"   Correct answers: {correct_answers_set}")
-            logger.info(f"   ✅ Correct selections: {num_correct}/{total_correct}")
-            logger.info(f"   ❌ Wrong selections: {num_wrong}")
-            logger.info(f"   ⚠️ Missed selections: {len(missed_selections)}")
-            logger.info(f"   📊 Partial credit: {partial_credit * 100:.1f}%")
+            is_correct = user_answers_set == correct_answers_set
             
         elif question_type == "dragAndDrop":
             # Drag and drop questions
@@ -201,10 +227,8 @@ class GameController:
                 logger.error(f"❌ No correct matches found for drag-drop question {current_index}")
                 return {"error": "Invalid question configuration"}
             
-            # Answer should be a dict/object of matches
             user_matches = answer if isinstance(answer, dict) else {}
             is_correct = user_matches == correct_matches
-            logger.info(f"🎯 Drag-drop check: user={user_id}, matches={user_matches}, correct={correct_matches}, is_correct={is_correct}")
         
         else:
             logger.error(f"❌ Unknown question type: {question_type}")
@@ -237,15 +261,6 @@ class GameController:
             
             points = partial_points + time_bonus
             
-            if partial_credit == 1.0:
-                logger.info(f"✅ Perfect answer! Base: {base_points}, Time bonus: {time_bonus} (multiplier: {multiplier:.2f}x), Total: {points}")
-            elif partial_credit > 0:
-                logger.info(f"⚠️ Partial credit! Base: {base_points} × {partial_credit:.2f} = {partial_points}, Time bonus: {time_bonus}, Total: {points}")
-            else:
-                logger.info(f"❌ No points (wrong selections outweigh correct ones)")
-            
-            logger.info(f"⏱️ Time stats: elapsed={timestamp:.2f}s, limit={question_time_limit}s")
-            
         elif is_correct:
             # Full credit for other question types
             base_points = 1000
@@ -253,17 +268,11 @@ class GameController:
             
             # Calculate time-based multiplier
             if timestamp is not None and timestamp >= 0:
-                # Clamp elapsed time to question's time limit
                 elapsed = min(timestamp, question_time_limit)
-                # Calculate multiplier: 2.0 at 0 seconds, 1.0 at time limit
-                # Linear interpolation: multiplier = 2.0 - (elapsed / time_limit)
                 multiplier = max(1.0, 2.0 - (elapsed / question_time_limit))
-                # Time bonus is the extra points from speed (base * (multiplier - 1))
                 time_bonus = int(base_points * (multiplier - 1))
             
             points = base_points + time_bonus
-            logger.info(f"✅ Correct answer! Base: {base_points}, Time bonus: {time_bonus} (multiplier: {multiplier:.2f}x), Total: {points}")
-            logger.info(f"⏱️ Time stats: elapsed={timestamp:.2f}s, limit={question_time_limit}s")
         
         # Update participant data
         participants = json.loads(participants_json)
@@ -289,7 +298,7 @@ class GameController:
             # Save back to Redis
             await self.redis.hset(session_key, "participants", json.dumps(participants))
             
-            logger.info(f"💾 Saved answer for {user_id}: score now {participant['score']}")
+            logger.debug(f"💾 Saved answer for {user_id}: Q{current_index}, score={participant['score']}")
             
             # Return correct answer based on question type
             correct_answer_response = None
@@ -411,11 +420,9 @@ class GameController:
         index = await self.redis.get(participant_key)
         
         if index is not None:
-            logger.info(f"📊 PROGRESS - Found cached index for {user_id}: {int(index)}")
             return int(index)
         
         # If not found, check their answers to determine progress
-        logger.info(f"🔍 PROGRESS - No cached index for {user_id}, checking answers")
         participants_json = await self.redis.hget(session_key, "participants")
         if participants_json:
             participants = json.loads(participants_json)
@@ -424,17 +431,15 @@ class GameController:
                 # Return the highest question index they've answered
                 if answers:
                     max_index = max(ans["question_index"] for ans in answers)
-                    logger.info(f"📊 PROGRESS - Calculated index from answers for {user_id}: {max_index}")
                     return max_index
         
-        logger.info(f"📊 PROGRESS - No progress found for {user_id}, defaulting to 0")
         return 0  # Default to first question
 
     async def set_participant_question_index(self, session_code: str, user_id: str, index: int):
         """Set the current question index for a specific participant"""
         participant_key = f"participant:{session_code}:{user_id}:question_index"
         await self.redis.set(participant_key, index)
-        logger.info(f"✅ PROGRESS - Set {user_id} question index to {index}")
+        logger.debug(f"✅ PROGRESS - Set {user_id} question index to {index}")
 
     async def get_total_questions(self, session_code: str) -> int:
         """Get total number of questions in the quiz"""

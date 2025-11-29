@@ -53,8 +53,6 @@ class LeaderboardManager:
         for idx, entry in enumerate(leaderboard):
             entry["position"] = idx + 1
         
-        logger.info(f"📊 Leaderboard for {session_code}: {len(leaderboard)} participants")
-        
         return leaderboard
 
     async def get_participant_rank(self, session_code: str, user_id: str) -> Dict[str, Any]:

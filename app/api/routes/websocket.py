@@ -18,6 +18,16 @@ leaderboard_manager = LeaderboardManager()
 # Store active timers for auto-advance
 active_timers = {}
 
+# Semaphore to limit concurrent answer processing per session
+answer_semaphores: dict[str, asyncio.Semaphore] = {}
+
+def get_answer_semaphore(session_code: str) -> asyncio.Semaphore:
+    """Get or create a semaphore for answer processing in a session"""
+    if session_code not in answer_semaphores:
+        # Allow up to 10 concurrent answer submissions per session
+        answer_semaphores[session_code] = asyncio.Semaphore(10)
+    return answer_semaphores[session_code]
+
 @router.websocket("/api/ws/{session_code}")
 async def websocket_endpoint(websocket: WebSocket, session_code: str, user_id: str = Query(...)):
     """
@@ -46,7 +56,7 @@ async def websocket_endpoint(websocket: WebSocket, session_code: str, user_id: s
                 message_type = message.get("type")
                 payload = message.get("payload", {})
                 
-                logger.info(f"📨 Received message type={message_type} from user={user_id}")
+                logger.debug(f"📨 Received message type={message_type} from user={user_id}")
 
                 if message_type == "join":
                     await handle_join(websocket, session_code, user_id, payload)
@@ -55,8 +65,11 @@ async def websocket_endpoint(websocket: WebSocket, session_code: str, user_id: s
                     await handle_start_quiz(websocket, session_code, user_id, payload)
                 
                 elif message_type == "submit_answer":
-                    logger.info(f"📝 Processing submit_answer from {user_id}")
-                    await handle_submit_answer(websocket, session_code, user_id, payload)
+                    logger.debug(f"📝 Processing submit_answer from {user_id}")
+                    # Use semaphore to prevent overwhelming Redis
+                    sem = get_answer_semaphore(session_code)
+                    async with sem:
+                        await handle_submit_answer(websocket, session_code, user_id, payload)
                 
                 elif message_type == "next_question":
                     await handle_next_question(websocket, session_code, user_id)
@@ -70,27 +83,31 @@ async def websocket_endpoint(websocket: WebSocket, session_code: str, user_id: s
                 elif message_type == "request_leaderboard":
                     await handle_request_leaderboard(websocket, session_code, user_id)
                 
+                elif message_type == "ping":
+                    # Handle ping/pong for keepalive
+                    await manager.send_personal_message({"type": "pong"}, websocket)
+                
                 else:
                     logger.warning(f"Unknown message type: {message_type}")
 
             except json.JSONDecodeError as e:
                 logger.error(f"Invalid JSON: {e}")
             except Exception as e:
-                logger.error(f"Error processing message: {e}")
+                logger.error(f"Error processing message: {e}", exc_info=True)
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected for user={user_id}")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"WebSocket error for user={user_id}: {e}")
     finally:
-        manager.disconnect(websocket, session_code, user_id)  # ✅ NO await!
+        manager.disconnect(websocket, session_code, user_id)
         logger.info(f"User {user_id} disconnected from session {session_code}")
 
 
 async def handle_join(websocket: WebSocket, session_code: str, user_id: str, payload: dict):
     username = payload.get("username", "Anonymous")
     
-    logger.info(f"📨 JOIN request - session={session_code}, user={user_id}, username={username}")
+    logger.debug(f"📨 JOIN request - session={session_code}, user={user_id}, username={username}")
     
     # Validate session
     session = await session_manager.get_session(session_code)
@@ -99,45 +116,29 @@ async def handle_join(websocket: WebSocket, session_code: str, user_id: str, pay
         await manager.send_personal_message({"type": "error", "payload": {"message": "Session not found"}}, websocket)
         return
     
-    logger.info(f"✅ Session {session_code} found. Current status: {session.get('status')}")
-    
     # ✅ CHECK IF USER IS HOST FIRST
     is_host = await session_manager.is_host(session_code, user_id)
     
     if is_host:
         # Host is joining - send session state without adding to participants
-        logger.info(f"✅ HOST {user_id} ({username}) joining their own session {session_code}")
+        logger.info(f"✅ HOST {user_id} joined session {session_code}")
         
         # Prepare session payload with participants as list
         session_payload = {**session}
         participants_list = list(session.get("participants", {}).values())
         session_payload["participants"] = participants_list
-        
-        # ✅ ADD participant_count for Flutter
         session_payload["participant_count"] = len(participants_list)
-        
-        logger.info(f"📊 HOST - Current participants: {len(participants_list)}")
-        for p in participants_list:
-            logger.info(f"   - {p.get('username', 'Unknown')} (ID: {p.get('user_id', 'Unknown')})")
         
         # Send session state to host
         await manager.send_personal_message({
             "type": "session_state",
             "payload": session_payload
         }, websocket)
-        
-        logger.info(f"✅ Sent session_state to HOST {user_id}")
         return  # Done - host doesn't get added to participants
     
     # ✅ REGULAR PARTICIPANT LOGIC BELOW
-    logger.info(f"👤 PARTICIPANT {user_id} ({username}) joining session {session_code}")
     participants = session.get("participants", {})
     is_reconnecting = user_id in participants
-    
-    if is_reconnecting:
-        logger.info(f"🔄 User {user_id} is RECONNECTING")
-    else:
-        logger.info(f"🆕 User {user_id} is a NEW participant")
     
     # Check if session is still accepting new participants
     if session["status"] != "waiting" and not is_reconnecting:
@@ -149,14 +150,11 @@ async def handle_join(websocket: WebSocket, session_code: str, user_id: str, pay
     success = await session_manager.add_participant(session_code, user_id, username)
     
     if success:
-        logger.info(f"✅ Successfully added {username} (ID: {user_id}) to session {session_code}")
+        logger.info(f"✅ {'Reconnected' if is_reconnecting else 'Added'} {username} to session {session_code}")
         
         # Broadcast update to all
         session = await session_manager.get_session(session_code)
         participants_list = list(session["participants"].values())
-        
-        logger.info(f"📡 Broadcasting session_update to all connections in {session_code}")
-        logger.info(f"📊 Total participants after join: {len(participants_list)}")
         
         await manager.broadcast_to_session({
             "type": "session_update",
@@ -167,13 +165,9 @@ async def handle_join(websocket: WebSocket, session_code: str, user_id: str, pay
             }
         }, session_code)
         
-        logger.info(f"✅ Broadcast complete for session {session_code}")
-        
         # Send current state to this participant
         session_payload = {**session}
         session_payload["participants"] = participants_list
-        
-        # ✅ ADD participant_count for Flutter
         session_payload["participant_count"] = len(participants_list)
         
         await manager.send_personal_message({
@@ -181,20 +175,17 @@ async def handle_join(websocket: WebSocket, session_code: str, user_id: str, pay
             "payload": session_payload
         }, websocket)
         
-        logger.info(f"✅ Sent session_state to participant {user_id}")
-        
         # If reconnecting during active quiz, send current question
         if is_reconnecting and session["status"] == "active":
-            logger.info(f"🎮 Sending current question to reconnecting user {user_id}")
+            logger.debug(f"🎮 Sending current question to reconnecting user {user_id}")
             question_data = await game_controller.get_current_question(session_code)
             if question_data:
                 await manager.send_personal_message({
                     "type": "question",
                     "payload": question_data
                 }, websocket)
-                logger.info(f"✅ Sent current question to {user_id}")
     else:
-        logger.error(f"❌ Failed to add {username} (ID: {user_id}) to session {session_code}")
+        logger.error(f"❌ Failed to add {username} to session {session_code}")
 
 
 async def auto_advance_question(session_code: str, time_limit: int, question_index: int):
@@ -332,50 +323,82 @@ async def handle_start_quiz(websocket: WebSocket, session_code: str, user_id: st
 
 async def handle_submit_answer(websocket: WebSocket, session_code: str, user_id: str, payload: dict):
     """Participant submits an answer"""
-    answer = payload.get("answer")
-    timestamp = payload.get("timestamp", datetime.utcnow().timestamp())
-    is_timeout = payload.get("timeout", False)
-    
-    # Allow null answers for timeouts
-    if answer is None and not is_timeout:
-        logger.error(f"❌ ANSWER - No answer provided in payload: {payload}")
+    try:
+        answer = payload.get("answer")
+        timestamp = payload.get("timestamp", datetime.utcnow().timestamp())
+        is_timeout = payload.get("timeout", False)
+        
+        # Allow null answers for timeouts
+        if answer is None and not is_timeout:
+            logger.debug(f"❌ ANSWER - No answer provided in payload: {payload}")
+            await manager.send_personal_message({
+                "type": "error",
+                "payload": {"message": "Invalid answer submission"}
+            }, websocket)
+            return
+        
+        if is_timeout:
+            logger.debug(f"⏰ ANSWER - User {user_id} timed out (no answer submitted)")
+        else:
+            logger.debug(f"📝 ANSWER - User {user_id} submitted answer: {answer}")
+        
+        # Process answer
+        result = await game_controller.submit_answer(
+            session_code, user_id, answer, timestamp
+        )
+        
+        # Check for errors
+        if "error" in result:
+            logger.debug(f"⚠️ ANSWER - Error for {user_id}: {result['error']}")
+            await manager.send_personal_message({
+                "type": "answer_result",
+                "payload": result
+            }, websocket)
+            return
+        
+        is_correct = result.get('is_correct', False)
+        points = result.get('points', 0)
+        logger.debug(f"{'✅' if is_correct else '❌'} ANSWER - Result for {user_id}: {'CORRECT' if is_correct else 'INCORRECT'}, Points: {points}")
+        
+        # Send result to participant
         await manager.send_personal_message({
-            "type": "error",
-            "payload": {"message": "Invalid answer submission"}
+            "type": "answer_result",
+            "payload": result
         }, websocket)
-        return
+        
+        # ✅ GET AND BROADCAST REAL-TIME LEADERBOARD (debounced for performance)
+        # Only broadcast every few answers to reduce load
+        session = await session_manager.get_session(session_code)
+        participants = session.get("participants", {}) if session else {}
+        participant_count = len(participants)
+        
+        # For large sessions (20+), only broadcast leaderboard every 5 answers
+        should_broadcast_leaderboard = True
+        if participant_count >= 20:
+            # Count how many have answered current question
+            answered_count = sum(
+                1 for p in participants.values() 
+                if any(a.get("question_index") == result.get("question_index", 0) for a in p.get("answers", []))
+            )
+            should_broadcast_leaderboard = answered_count % 5 == 0 or answered_count == participant_count
+        
+        if should_broadcast_leaderboard:
+            leaderboard = await leaderboard_manager.get_leaderboard(session_code)
+            await manager.broadcast_to_session({
+                "type": "leaderboard_update",
+                "payload": {"leaderboard": leaderboard}
+            }, session_code)
+            logger.debug(f"🏆 LEADERBOARD - Broadcasted to session {session_code}")
     
-    if is_timeout:
-        logger.info(f"⏰ ANSWER - User {user_id} timed out (no answer submitted)")
-    else:
-        logger.info(f"📝 ANSWER - User {user_id} submitted answer: {answer} (timestamp: {timestamp})")
-    
-    # Process answer
-    result = await game_controller.submit_answer(
-        session_code, user_id, answer, timestamp
-    )
-    
-    is_correct = result.get('is_correct', False)
-    points = result.get('points', 0)
-    logger.info(f"{'✅' if is_correct else '❌'} ANSWER - Result for {user_id}: {'CORRECT' if is_correct else 'INCORRECT'}, Points: {points}")
-    
-    # Send result to participant
-    await manager.send_personal_message({
-        "type": "answer_result",
-        "payload": result
-    }, websocket)
-    logger.info(f"📤 ANSWER - Sent answer result to {user_id}")
-    
-    # ✅ GET AND BROADCAST REAL-TIME LEADERBOARD
-    leaderboard = await leaderboard_manager.get_leaderboard(session_code)
-    logger.info(f"🏆 LEADERBOARD - Broadcasting update to session {session_code} ({len(leaderboard)} participants)")
-    
-    await manager.broadcast_to_session({
-        "type": "leaderboard_update",
-        "payload": {"leaderboard": leaderboard}
-    }, session_code)
-    
-    logger.info(f"✅ LEADERBOARD - Broadcast complete for session {session_code}")
+    except Exception as e:
+        logger.error(f"❌ ANSWER - Error processing answer for {user_id}: {e}", exc_info=True)
+        try:
+            await manager.send_personal_message({
+                "type": "error",
+                "payload": {"message": "Error processing answer"}
+            }, websocket)
+        except:
+            pass
 
 
 async def handle_next_question(websocket: WebSocket, session_code: str, user_id: str):
@@ -424,128 +447,140 @@ async def handle_next_question(websocket: WebSocket, session_code: str, user_id:
 
 async def handle_request_next_question(websocket: WebSocket, session_code: str, user_id: str):
     """Participant requests their next question (self-paced)"""
-    logger.info(f"📨 SELF_PACED - Participant {user_id} requesting next question")
+    try:
+        logger.debug(f"📨 SELF_PACED - Participant {user_id} requesting next question")
+        
+        # Get participant's current progress
+        participant_question_index = await game_controller.get_participant_question_index(session_code, user_id)
+        total_questions = await game_controller.get_total_questions(session_code)
+        
+        if total_questions == 0:
+            logger.error(f"❌ SELF_PACED - No questions found for session {session_code}")
+            await manager.send_personal_message({
+                "type": "error",
+                "payload": {"message": "Quiz not found"}
+            }, websocket)
+            return
+        
+        logger.debug(f"📊 SELF_PACED - Current index for {user_id}: {participant_question_index}/{total_questions}")
+        
+        # Check if participant has already completed all questions
+        # They completed if their index is at or past the last question (total - 1)
+        if participant_question_index >= total_questions - 1:
+            logger.info(f"🏁 SELF_PACED - Participant {user_id} has completed all questions!")
+            
+            # Get final results
+            final_results = await leaderboard_manager.get_final_results(session_code)
+            
+            # Send completion message to participant
+            await manager.send_personal_message({
+                "type": "quiz_completed",
+                "payload": {
+                    "message": "You've completed all questions!",
+                    "results": final_results
+                }
+            }, websocket)
+            
+            # Check if ALL participants have completed (debounced)
+            await check_all_participants_completed(session_code, total_questions)
+            return
+        
+        # Increment their question index
+        next_index = participant_question_index + 1
+        await game_controller.set_participant_question_index(session_code, user_id, next_index)
+        
+        logger.debug(f"➡️ SELF_PACED - Participant {user_id} advancing: Q{participant_question_index} → Q{next_index}")
+        
+        # Get the next question for this participant
+        question_data = await game_controller.get_question_by_index(session_code, next_index)
+        
+        if question_data:
+            # Send next question to this participant only
+            await manager.send_personal_message({
+                "type": "question",
+                "payload": question_data
+            }, websocket)
+            logger.debug(f"✅ SELF_PACED - Sent Q{next_index + 1}/{total_questions} to {user_id}")
+        else:
+            # No more questions - participant finished
+            logger.info(f"🏁 SELF_PACED - Participant {user_id} completed all questions!")
+            
+            # Get final results
+            final_results = await leaderboard_manager.get_final_results(session_code)
+            
+            # Send completion message to participant
+            await manager.send_personal_message({
+                "type": "quiz_completed",
+                "payload": {
+                    "message": "You've completed all questions!",
+                    "results": final_results
+                }
+            }, websocket)
+            
+            # Check if ALL participants have completed
+            await check_all_participants_completed(session_code, total_questions)
     
-    # Get participant's current progress
-    participant_question_index = await game_controller.get_participant_question_index(session_code, user_id)
-    total_questions = await game_controller.get_total_questions(session_code)
-    
-    logger.info(f"📊 SELF_PACED - Current index for {user_id}: {participant_question_index}/{total_questions}")
-    logger.info(f"🔍 SELF_PACED - Checking completion: {participant_question_index} >= {total_questions - 1} = {participant_question_index >= total_questions - 1}")
-    
-    # Check if participant has already completed all questions
-    if participant_question_index >= total_questions - 1:
-        logger.info(f"🏁 SELF_PACED - ✅ COMPLETION TRIGGERED! Participant {user_id} has completed all questions!")
-        
-        # Get final results
-        final_results = await leaderboard_manager.get_final_results(session_code)
-        
-        # Send completion message to participant
-        await manager.send_personal_message({
-            "type": "quiz_completed",
-            "payload": {
-                "message": "You've completed all questions!",
-                "results": final_results
-            }
-        }, websocket)
-        logger.info(f"✅ SELF_PACED - Sent completion message to {user_id}")
-        
-        # Broadcast updated leaderboard to everyone (including host)
-        leaderboard = await leaderboard_manager.get_leaderboard(session_code)
-        await manager.broadcast_to_session({
-            "type": "leaderboard_update",
-            "payload": {"leaderboard": leaderboard}
-        }, session_code)
-        logger.info(f"📢 SELF_PACED - Broadcasted leaderboard update after {user_id} completed")
-        
-        # Check if ALL participants have completed
-        await check_all_participants_completed(session_code, total_questions)
-        
-        return
-    
-    # Increment their question index
-    next_index = participant_question_index + 1
-    await game_controller.set_participant_question_index(session_code, user_id, next_index)
-    
-    logger.info(f"➡️ SELF_PACED - Participant {user_id} advancing: Q{participant_question_index} → Q{next_index}")
-    
-    # Get the next question for this participant
-    question_data = await game_controller.get_question_by_index(session_code, next_index)
-    
-    if question_data:
-        # Send next question to this participant only
-        logger.info(f"📤 SELF_PACED - Sending Q{next_index + 1}/{total_questions} to participant {user_id}")
-        await manager.send_personal_message({
-            "type": "question",
-            "payload": question_data
-        }, websocket)
-        logger.info(f"✅ SELF_PACED - Successfully sent Q{next_index + 1} to {user_id}")
-    else:
-        # No more questions - participant finished
-        logger.info(f"🏁 SELF_PACED - Participant {user_id} completed all questions!")
-        
-        # Get final results
-        final_results = await leaderboard_manager.get_final_results(session_code)
-        
-        # Send completion message to participant
-        await manager.send_personal_message({
-            "type": "quiz_completed",
-            "payload": {
-                "message": "You've completed all questions!",
-                "results": final_results
-            }
-        }, websocket)
-        logger.info(f"✅ SELF_PACED - Sent completion message to {user_id}")
-        
-        # Broadcast updated leaderboard to everyone (including host)
-        leaderboard = await leaderboard_manager.get_leaderboard(session_code)
-        await manager.broadcast_to_session({
-            "type": "leaderboard_update",
-            "payload": {"leaderboard": leaderboard}
-        }, session_code)
-        logger.info(f"📢 SELF_PACED - Broadcasted leaderboard update after {user_id} completed")
-        
-        # Check if ALL participants have completed
-        await check_all_participants_completed(session_code, total_questions)
+    except Exception as e:
+        logger.error(f"❌ SELF_PACED - Error for {user_id}: {e}", exc_info=True)
+        try:
+            await manager.send_personal_message({
+                "type": "error",
+                "payload": {"message": "Error getting next question"}
+            }, websocket)
+        except:
+            pass
 
 
 async def check_all_participants_completed(session_code: str, total_questions: int):
     """Check if all participants have completed the quiz and broadcast quiz_ended if so"""
-    session = await session_manager.get_session(session_code)
-    if not session:
-        return
-    
-    participants = session.get("participants", {})
-    if not participants:
-        return
-    
-    # Check each participant's progress
-    all_completed = True
-    for participant_id in participants.keys():
-        participant_index = await game_controller.get_participant_question_index(session_code, participant_id)
-        # Participant has completed if they're on the last question or beyond
-        if participant_index < total_questions - 1:
-            all_completed = False
-            break
-    
-    if all_completed:
-        logger.info(f"🎉 ALL PARTICIPANTS COMPLETED! Broadcasting quiz_ended to session {session_code}")
+    try:
+        session = await session_manager.get_session(session_code)
+        if not session:
+            return
         
-        # Mark session as completed
-        await session_manager.end_session(session_code)
+        # Skip if already completed
+        if session.get("status") == "completed":
+            return
         
-        # Get final results
-        final_results = await leaderboard_manager.get_final_results(session_code)
+        participants = session.get("participants", {})
+        if not participants:
+            return
         
-        # Broadcast quiz_ended to everyone (this triggers the podium on host)
-        await manager.broadcast_to_session({
-            "type": "quiz_ended",
-            "payload": {
-                "message": "All participants have completed the quiz!",
-                "results": final_results
-            }
-        }, session_code)
-        logger.info(f"✅ Broadcasted quiz_ended with final results to session {session_code}")
+        # Check each participant's progress
+        all_completed = True
+        completed_count = 0
+        
+        for participant_id in participants.keys():
+            participant_index = await game_controller.get_participant_question_index(session_code, participant_id)
+            # Participant has completed if they're on the last question or beyond
+            if participant_index >= total_questions - 1:
+                completed_count += 1
+            else:
+                all_completed = False
+        
+        logger.debug(f"📊 COMPLETION CHECK - {completed_count}/{len(participants)} completed in session {session_code}")
+        
+        if all_completed:
+            logger.info(f"🎉 ALL PARTICIPANTS COMPLETED! Broadcasting quiz_ended to session {session_code}")
+            
+            # Mark session as completed
+            await session_manager.end_session(session_code)
+            
+            # Get final results
+            final_results = await leaderboard_manager.get_final_results(session_code)
+            
+            # Broadcast quiz_ended to everyone (this triggers the podium on host)
+            await manager.broadcast_to_session({
+                "type": "quiz_ended",
+                "payload": {
+                    "message": "All participants have completed the quiz!",
+                    "results": final_results
+                }
+            }, session_code)
+            logger.info(f"✅ Broadcasted quiz_ended with final results to session {session_code}")
+    
+    except Exception as e:
+        logger.error(f"❌ COMPLETION CHECK - Error: {e}", exc_info=True)
 
 
 async def handle_end_quiz(websocket: WebSocket, session_code: str, user_id: str):
@@ -577,55 +612,50 @@ async def handle_end_quiz(websocket: WebSocket, session_code: str, user_id: str)
 
 async def handle_request_leaderboard(websocket: WebSocket, session_code: str, user_id: str):
     """Participant requests real-time leaderboard with question progress"""
-    logger.info(f"🏆 LEADERBOARD_REQUEST - User {user_id} requesting leaderboard for session {session_code}")
-    
-    # Get session data with participants
-    session = await session_manager.get_session(session_code)
-    if not session:
-        logger.error(f"❌ Session {session_code} not found")
+    try:
+        # Get session data with participants
+        session = await session_manager.get_session(session_code)
+        if not session:
+            await manager.send_personal_message({
+                "type": "error",
+                "payload": {"message": "Session not found"}
+            }, websocket)
+            return
+        
+        participants = session.get("participants", {})
+        total_questions = session.get("total_questions", 0)
+        
+        # Build leaderboard with question progress
+        leaderboard_entries = []
+        for participant_id, participant_data in participants.items():
+            # Get participant's current question index
+            question_index = await game_controller.get_participant_question_index(session_code, participant_id)
+            
+            # Count answered questions from their answers array
+            answers = participant_data.get("answers", [])
+            answered_count = len(answers)
+            
+            leaderboard_entries.append({
+                "user_id": participant_id,
+                "username": participant_data.get("username", "Unknown"),
+                "score": participant_data.get("score", 0),
+                "question_index": question_index,
+                "answered_count": answered_count,
+                "total_questions": total_questions,
+                "connected": participant_data.get("connected", False)
+            })
+        
+        # Sort by score (descending)
+        leaderboard_entries.sort(key=lambda x: x["score"], reverse=True)
+        
+        # Send leaderboard to requesting user
         await manager.send_personal_message({
-            "type": "error",
-            "payload": {"message": "Session not found"}
+            "type": "leaderboard_response",
+            "payload": {
+                "leaderboard": leaderboard_entries,
+                "total_questions": total_questions
+            }
         }, websocket)
-        return
     
-    participants = session.get("participants", {})
-    total_questions = session.get("total_questions", 0)
-    
-    # Build leaderboard with question progress
-    leaderboard_entries = []
-    for participant_id, participant_data in participants.items():
-        # Get participant's current question index
-        question_index = await game_controller.get_participant_question_index(session_code, participant_id)
-        
-        # Count answered questions from their answers array
-        answers = participant_data.get("answers", [])
-        answered_count = len(answers)
-        
-        leaderboard_entries.append({
-            "user_id": participant_id,
-            "username": participant_data.get("username", "Unknown"),
-            "score": participant_data.get("score", 0),
-            "question_index": question_index,
-            "answered_count": answered_count,
-            "total_questions": total_questions,
-            "connected": participant_data.get("connected", False)
-        })
-    
-    # Sort by score (descending)
-    leaderboard_entries.sort(key=lambda x: x["score"], reverse=True)
-    
-    logger.info(f"📊 LEADERBOARD_REQUEST - Sending {len(leaderboard_entries)} entries to {user_id}")
-    for i, entry in enumerate(leaderboard_entries[:5]):
-        logger.info(f"   {i+1}. {entry['username']}: {entry['score']} pts (Q{entry['answered_count']}/{total_questions})")
-    
-    # Send leaderboard to requesting user
-    await manager.send_personal_message({
-        "type": "leaderboard_response",
-        "payload": {
-            "leaderboard": leaderboard_entries,
-            "total_questions": total_questions
-        }
-    }, websocket)
-    
-    logger.info(f"✅ LEADERBOARD_REQUEST - Sent leaderboard to {user_id}")
+    except Exception as e:
+        logger.error(f"❌ LEADERBOARD_REQUEST - Error: {e}", exc_info=True)

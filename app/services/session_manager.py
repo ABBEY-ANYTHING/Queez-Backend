@@ -123,7 +123,7 @@ class SessionManager:
                         # Reconnecting user - preserve state
                         participants[user_id]["connected"] = True
                         participants[user_id]["username"] = username
-                        logger.info(f"🔄 Reconnecting participant {username} ({user_id}) to session {session_code}")
+                        logger.debug(f"🔄 Reconnecting participant {username} ({user_id})")
                     else:
                         # New participant
                         participants[user_id] = {
@@ -134,11 +134,11 @@ class SessionManager:
                             "score": 0,
                             "answers": []
                         }
-                        logger.info(f"🆕 Adding NEW participant {username} ({user_id}) to session {session_code}")
+                        logger.debug(f"🆕 New participant {username} ({user_id})")
                     
                     # Save updated participants
                     await self.redis.hset(session_key, "participants", json.dumps(participants))
-                    logger.info(f"✅ Successfully added {username} to session {session_code} (total: {len(participants)} participants)")
+                    logger.debug(f"✅ Session {session_code} now has {len(participants)} participants")
                     return True
                     
                 finally:
