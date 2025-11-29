@@ -458,6 +458,9 @@ async def handle_request_next_question(websocket: WebSocket, session_code: str, 
         }, session_code)
         logger.info(f"📢 SELF_PACED - Broadcasted leaderboard update after {user_id} completed")
         
+        # Check if ALL participants have completed
+        await check_all_participants_completed(session_code, total_questions)
+        
         return
     
     # Increment their question index
@@ -501,6 +504,48 @@ async def handle_request_next_question(websocket: WebSocket, session_code: str, 
             "payload": {"leaderboard": leaderboard}
         }, session_code)
         logger.info(f"📢 SELF_PACED - Broadcasted leaderboard update after {user_id} completed")
+        
+        # Check if ALL participants have completed
+        await check_all_participants_completed(session_code, total_questions)
+
+
+async def check_all_participants_completed(session_code: str, total_questions: int):
+    """Check if all participants have completed the quiz and broadcast quiz_ended if so"""
+    session = await session_manager.get_session(session_code)
+    if not session:
+        return
+    
+    participants = session.get("participants", {})
+    if not participants:
+        return
+    
+    # Check each participant's progress
+    all_completed = True
+    for participant_id in participants.keys():
+        participant_index = await game_controller.get_participant_question_index(session_code, participant_id)
+        # Participant has completed if they're on the last question or beyond
+        if participant_index < total_questions - 1:
+            all_completed = False
+            break
+    
+    if all_completed:
+        logger.info(f"🎉 ALL PARTICIPANTS COMPLETED! Broadcasting quiz_ended to session {session_code}")
+        
+        # Mark session as completed
+        await session_manager.end_session(session_code)
+        
+        # Get final results
+        final_results = await leaderboard_manager.get_final_results(session_code)
+        
+        # Broadcast quiz_ended to everyone (this triggers the podium on host)
+        await manager.broadcast_to_session({
+            "type": "quiz_ended",
+            "payload": {
+                "message": "All participants have completed the quiz!",
+                "results": final_results
+            }
+        }, session_code)
+        logger.info(f"✅ Broadcasted quiz_ended with final results to session {session_code}")
 
 
 async def handle_end_quiz(websocket: WebSocket, session_code: str, user_id: str):
