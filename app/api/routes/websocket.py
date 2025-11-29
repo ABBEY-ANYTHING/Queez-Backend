@@ -4,6 +4,7 @@ from app.services.connection_manager import manager
 from app.services.session_manager import SessionManager
 from app.services.game_controller import GameController
 from app.services.leaderboard_manager import LeaderboardManager
+from app.core.database import get_redis
 import json
 import logging
 import asyncio
@@ -441,14 +442,23 @@ async def handle_request_next_question(websocket: WebSocket, session_code: str, 
             }, websocket)
             return
         
-        # Check if participant has completed all questions
+        # Check if participant has already completed all questions
         if current_index >= total_questions:
-            logger.info(f"Participant {user_id} completed all questions")
+            # Check if we already marked this user as completed (to avoid duplicate logs)
+            redis = await get_redis()
+            completed_key = f"completed:{session_code}:{user_id}"
+            already_completed = await redis.get(completed_key)
             
-            # Get final results
+            if not already_completed:
+                # First time completing - log and mark
+                await redis.set(completed_key, "1", ex=3600)  # 1 hour expiry
+                logger.info(f"Participant {user_id} completed all questions in session {session_code}")
+                
+                # Check if ALL participants have completed
+                await check_all_participants_completed(session_code, total_questions)
+            
+            # Always send completion message to participant (they might have refreshed)
             final_results = await leaderboard_manager.get_final_results(session_code)
-            
-            # Send completion message to participant
             await manager.send_personal_message({
                 "type": "quiz_completed",
                 "payload": {
@@ -456,9 +466,6 @@ async def handle_request_next_question(websocket: WebSocket, session_code: str, 
                     "results": final_results
                 }
             }, websocket)
-            
-            # Check if ALL participants have completed
-            await check_all_participants_completed(session_code, total_questions)
             return
         
         # Get the question at current index
@@ -471,23 +478,8 @@ async def handle_request_next_question(websocket: WebSocket, session_code: str, 
                 "payload": question_data
             }, websocket)
         else:
-            # No more questions - participant finished
-            logger.info(f"Participant {user_id} completed all questions")
-            
-            # Get final results
-            final_results = await leaderboard_manager.get_final_results(session_code)
-            
-            # Send completion message to participant
-            await manager.send_personal_message({
-                "type": "quiz_completed",
-                "payload": {
-                    "message": "You've completed all questions!",
-                    "results": final_results
-                }
-            }, websocket)
-            
-            # Check if ALL participants have completed
-            await check_all_participants_completed(session_code, total_questions)
+            # Edge case: question_data is None but index < total (shouldn't happen)
+            logger.warning(f"No question data for index {current_index} in session {session_code}")
     
     except Exception as e:
         logger.error(f"Error getting next question for {user_id}: {e}", exc_info=True)
@@ -503,46 +495,59 @@ async def handle_request_next_question(websocket: WebSocket, session_code: str, 
 async def check_all_participants_completed(session_code: str, total_questions: int):
     """Check if all participants have completed the quiz and broadcast quiz_ended if so"""
     try:
-        session = await session_manager.get_session(session_code)
-        if not session:
-            return
+        # Use Redis lock to prevent multiple concurrent completion checks
+        redis = await get_redis()
+        completion_lock_key = f"completion_check:{session_code}"
         
-        # Skip if already completed
-        if session.get("status") == "completed":
-            return
+        # Try to acquire the completion check lock (only one check at a time)
+        lock_acquired = await redis.set(completion_lock_key, "1", ex=30, nx=True)
+        if not lock_acquired:
+            return  # Another check is in progress
         
-        participants = session.get("participants", {})
-        if not participants:
-            return
-        
-        # Check each participant's progress
-        all_completed = True
-        completed_count = 0
-        
-        for participant_id in participants.keys():
-            participant_index = await game_controller.get_participant_question_index(session_code, participant_id)
-            if participant_index >= total_questions:
-                completed_count += 1
-            else:
-                all_completed = False
-        
-        if all_completed:
-            logger.info(f"All {completed_count} participants completed session {session_code}")
+        try:
+            session = await session_manager.get_session(session_code)
+            if not session:
+                return
             
-            # Mark session as completed
-            await session_manager.end_session(session_code)
+            # Skip if already completed
+            if session.get("status") == "completed":
+                return
             
-            # Get final results
-            final_results = await leaderboard_manager.get_final_results(session_code)
+            participants = session.get("participants", {})
+            if not participants:
+                return
             
-            # Broadcast quiz_ended to everyone (this triggers the podium on host)
-            await manager.broadcast_to_session({
-                "type": "quiz_ended",
-                "payload": {
-                    "message": "All participants have completed the quiz!",
-                    "results": final_results
-                }
-            }, session_code)
+            # Check each participant's progress
+            all_completed = True
+            completed_count = 0
+            
+            for participant_id in participants.keys():
+                participant_index = await game_controller.get_participant_question_index(session_code, participant_id)
+                if participant_index >= total_questions:
+                    completed_count += 1
+                else:
+                    all_completed = False
+            
+            if all_completed:
+                logger.info(f"All {completed_count} participants completed session {session_code}")
+                
+                # Mark session as completed
+                await session_manager.end_session(session_code)
+                
+                # Get final results
+                final_results = await leaderboard_manager.get_final_results(session_code)
+                
+                # Broadcast quiz_ended to everyone (this triggers the podium on host)
+                await manager.broadcast_to_session({
+                    "type": "quiz_ended",
+                    "payload": {
+                        "message": "All participants have completed the quiz!",
+                        "results": final_results
+                    }
+                }, session_code)
+        finally:
+            # Always release the lock
+            await redis.delete(completion_lock_key)
     
     except Exception as e:
         logger.error(f"Completion check error: {e}", exc_info=True)
