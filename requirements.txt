@@ -10,3 +10,4 @@ websockets
 python-socketio
 google-generativeai
 requests
+firebase-admin
