@@ -400,7 +400,7 @@ IMPORTANT: Return ONLY valid JSON without any markdown formatting or code blocks
             "updatedAt": current_time
         }
         
-        logger.info(f"Successfully generated study set: {request.config.name}")
+        logger.info(f"Successfully generated study set: {study_set['name']}")
         logger.info(f"Quizzes: {len(quizzes)}, Flashcard Sets: {len(flashcard_sets)}, Notes: {len(notes)}")
         
         # Return the generated study set
