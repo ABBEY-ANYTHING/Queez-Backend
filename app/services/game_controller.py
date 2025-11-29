@@ -18,14 +18,11 @@ class GameController:
         """Get the current question for the session"""
         session_key = f"session:{session_code}"
         
-        logger.info(f"📚 Getting current question for session {session_code}")
-        
         # Get current index and quiz ID
         session_data = await self.redis.hmget(session_key, ["current_question_index", "quiz_id", "question_start_time"])
-        logger.info(f"📊 Session data from Redis: index={session_data[0]}, quiz_id={session_data[1]}")
         
         if not all(session_data[:2]): # Check if index and quiz_id exist
-            logger.error(f"❌ Missing session data! index={session_data[0]}, quiz_id={session_data[1]}")
+            logger.error(f"Missing session data for {session_code}")
             return None
             
         current_index = int(session_data[0])
@@ -33,22 +30,18 @@ class GameController:
         start_time = session_data[2]
         
         # Fetch quiz from MongoDB (could be cached in Redis for performance)
-        logger.info(f"🔍 Fetching quiz from MongoDB with ID: {quiz_id}")
         quiz = await quiz_collection.find_one({"_id": ObjectId(quiz_id)})
         
         if not quiz:
-            logger.error(f"❌ Quiz not found in MongoDB with ID: {quiz_id}")
+            logger.error(f"Quiz not found: {quiz_id}")
             return None
             
         if "questions" not in quiz:
-            logger.error(f"❌ Quiz {quiz_id} has no questions field!")
+            logger.error(f"Quiz {quiz_id} has no questions!")
             return None
-            
-        logger.info(f"✅ Quiz loaded successfully. Total questions: {len(quiz['questions'])}")
             
         questions = quiz["questions"]
         if current_index >= len(questions):
-            logger.warning(f"⚠️ Question index {current_index} out of range (total: {len(questions)})")
             return None
             
         question = questions[current_index]
@@ -59,10 +52,8 @@ class GameController:
         
         # Validate question text is not empty
         if not question_text or not question_text.strip():
-            logger.error(f"❌ Question {current_index} has empty question text!")
+            logger.error(f"Question {current_index} has empty text!")
             return None
-        
-        logger.info(f"✅ Retrieved question {current_index + 1}/{len(questions)}: {question_text[:50]}...")
         
         # Get per-question time limit (default to global config if not set)
         question_time_limit = question.get('timeLimit', QUESTION_TIME_SECONDS)
@@ -136,7 +127,7 @@ class GameController:
                     await self.redis.delete(answer_lock_key)
                     
             except Exception as e:
-                logger.error(f"❌ Answer submission error for {user_id} (attempt {attempt + 1}): {e}")
+                logger.error(f"Answer submission error for {user_id} (attempt {attempt + 1}): {e}")
                 try:
                     await self.redis.delete(answer_lock_key)
                 except:
@@ -160,7 +151,7 @@ class GameController:
         # Get participant's current question index
         current_index = await self.get_participant_question_index(session_code, user_id)
         
-        logger.info(f"📝 Processing answer for {user_id} on Q{current_index + 1}")
+        logger.debug(f"Processing answer for {user_id} on Q{current_index + 1}")
 
         # Try to get quiz from cache first
         cached_quiz = await self.redis.get(cache_key)
@@ -196,13 +187,12 @@ class GameController:
         
         # Handle timeout (null answer)
         if answer is None:
-            logger.debug(f"⏰ Timeout - user {user_id} did not answer in time")
             is_correct = False
         elif question_type in ["singleMcq", "trueFalse"]:
             # Single answer questions
             correct_answer = question.get("correctAnswerIndex")
             if correct_answer is None:
-                logger.error(f"❌ No correct answer found for question {current_index}")
+                logger.error(f"No correct answer for Q{current_index}")
                 return {"error": "Invalid question configuration"}
             
             is_correct = int(answer) == int(correct_answer)
@@ -211,7 +201,7 @@ class GameController:
             # Multiple answer questions with partial credit
             correct_answers = question.get("correctAnswerIndices", [])
             if not correct_answers:
-                logger.error(f"❌ No correct answers found for multi-choice question {current_index}")
+                logger.error(f"No correct answers for multi-choice Q{current_index}")
                 return {"error": "Invalid question configuration"}
             
             # Answer should be a list of indices
@@ -239,14 +229,14 @@ class GameController:
             # Drag and drop questions
             correct_matches = question.get("correctMatches", {})
             if not correct_matches:
-                logger.error(f"❌ No correct matches found for drag-drop question {current_index}")
+                logger.error(f"No correct matches for drag-drop Q{current_index}")
                 return {"error": "Invalid question configuration"}
             
             user_matches = answer if isinstance(answer, dict) else {}
             is_correct = user_matches == correct_matches
         
         else:
-            logger.error(f"❌ Unknown question type: {question_type}")
+            logger.error(f"Unknown question type: {question_type}")
             return {"error": "Unknown question type"}
         
         # Calculate points (time-based scoring with multiplier)
@@ -318,7 +308,7 @@ class GameController:
                 
                 participants = json.loads(participants_json)
                 if user_id not in participants:
-                    logger.error(f"❌ Participant {user_id} not found in session")
+                    logger.error(f"Participant {user_id} not found")
                     return {"error": "Participant not found"}
                 
                 participant = participants[user_id]
@@ -326,7 +316,7 @@ class GameController:
                 # Check if already answered
                 for ans in participant["answers"]:
                     if ans["question_index"] == current_index:
-                        logger.warning(f"⚠️ User {user_id} already answered question {current_index}")
+                        logger.debug(f"User {user_id} already answered Q{current_index}")
                         return {"error": "Already answered"}
                 
                 # Record answer
@@ -339,9 +329,9 @@ class GameController:
                 })
                 participant["score"] += points
                 
-                # Log BEFORE saving
+                # Log BEFORE saving (debug level for production)
                 answers_count = len(participant["answers"])
-                logger.info(f"💾 SAVING - {user_id}: Q{current_index + 1}, answers={answers_count}, score={participant['score']}")
+                logger.debug(f"Saving {user_id}: Q{current_index + 1}, answers={answers_count}")
                 
                 # Save back to Redis
                 await self.redis.hset(session_key, "participants", json.dumps(participants))
@@ -354,18 +344,19 @@ class GameController:
                 await self.redis.delete(participants_lock_key)
         else:
             # Failed to acquire lock after all retries
-            logger.error(f"❌ Failed to acquire participants lock for {user_id}")
+            logger.error(f"Failed to acquire participants lock for {user_id}")
             return {"error": "Server busy, please try again"}
         
-        # Verify save by reading back (outside lock for performance)
-        verify_json = await self.redis.hget(session_key, "participants")
-        verify_participants = json.loads(verify_json)
-        if user_id in verify_participants:
-            verify_count = len(verify_participants[user_id].get("answers", []))
-            if verify_count != answers_count:
-                logger.error(f"❌ MISMATCH - {user_id}: expected {answers_count}, got {verify_count} in Redis!")
-            else:
-                logger.info(f"✅ VERIFIED - {user_id}: {verify_count} answers in Redis")
+        # Verification (debug only - remove in production for performance)
+        if logger.isEnabledFor(logging.DEBUG):
+            verify_json = await self.redis.hget(session_key, "participants")
+            verify_participants = json.loads(verify_json)
+            if user_id in verify_participants:
+                verify_count = len(verify_participants[user_id].get("answers", []))
+                if verify_count != answers_count:
+                    logger.error(f"MISMATCH - {user_id}: expected {answers_count}, got {verify_count}")
+                else:
+                    logger.debug(f"Verified {user_id}: {verify_count} answers")
         
         # Return correct answer based on question type
         correct_answer_response = None
@@ -501,7 +492,6 @@ class GameController:
         """Set the current question index for a specific participant"""
         participant_key = f"participant:{session_code}:{user_id}:question_index"
         await self.redis.set(participant_key, index)
-        logger.debug(f"✅ PROGRESS - Set {user_id} question index to {index}")
 
     async def get_total_questions(self, session_code: str) -> int:
         """Get total number of questions in the quiz (uses cached data)"""
@@ -538,7 +528,7 @@ class GameController:
         session_key = f"session:{session_code}"
         cache_key = f"quiz_cache:{session_code}"
         
-        logger.debug(f"📚 Getting question {index} for session {session_code}")
+        logger.debug(f"Getting question {index} for session {session_code}")
         
         # Get session time settings
         session_per_question_limit_raw = await self.redis.hget(session_key, "per_question_time_limit")
@@ -555,13 +545,13 @@ class GameController:
             quiz_id = await self.redis.hget(session_key, "quiz_id")
             
             if not quiz_id:
-                logger.error(f"❌ Quiz ID not found for session {session_code}")
+                logger.error(f"Quiz ID not found for session {session_code}")
                 return None
             
             quiz = await quiz_collection.find_one({"_id": ObjectId(quiz_id)})
             
             if not quiz or "questions" not in quiz:
-                logger.error(f"❌ Quiz or questions not found")
+                logger.error(f"Quiz or questions not found")
                 return None
             
             questions = quiz["questions"]
@@ -574,7 +564,6 @@ class GameController:
             await self.redis.setex(cache_key, 3600, json.dumps(quiz_to_cache))
         
         if index >= len(questions):
-            logger.debug(f"⚠️ Question index {index} out of range (total: {len(questions)})")
             return None
         
         question = questions[index]
@@ -584,10 +573,8 @@ class GameController:
         question_type = question.get('type', 'single')
         
         if not question_text or not question_text.strip():
-            logger.error(f"❌ Question {index} has empty question text!")
+            logger.error(f"Question {index} has empty text!")
             return None
-        
-        logger.debug(f"✅ Retrieved question {index + 1}/{len(questions)}: {question_text[:50]}...")
         
         # Use session's per-question time limit (set by host)
         question_time_limit = session_per_question_limit

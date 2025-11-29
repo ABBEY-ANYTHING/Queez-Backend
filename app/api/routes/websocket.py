@@ -65,7 +65,7 @@ async def websocket_endpoint(websocket: WebSocket, session_code: str, user_id: s
                     await handle_start_quiz(websocket, session_code, user_id, payload)
                 
                 elif message_type == "submit_answer":
-                    logger.debug(f"📝 Processing submit_answer from {user_id}")
+                    logger.debug(f"Processing submit_answer from {user_id}")
                     # Use semaphore to prevent overwhelming Redis
                     sem = get_answer_semaphore(session_code)
                     async with sem:
@@ -107,12 +107,10 @@ async def websocket_endpoint(websocket: WebSocket, session_code: str, user_id: s
 async def handle_join(websocket: WebSocket, session_code: str, user_id: str, payload: dict):
     username = payload.get("username", "Anonymous")
     
-    logger.debug(f"📨 JOIN request - session={session_code}, user={user_id}, username={username}")
-    
     # Validate session
     session = await session_manager.get_session(session_code)
     if not session:
-        logger.error(f"❌ Session {session_code} not found!")
+        logger.warning(f"Session {session_code} not found")
         await manager.send_personal_message({"type": "error", "payload": {"message": "Session not found"}}, websocket)
         return
     
@@ -121,7 +119,7 @@ async def handle_join(websocket: WebSocket, session_code: str, user_id: str, pay
     
     if is_host:
         # Host is joining - send session state without adding to participants
-        logger.info(f"✅ HOST {user_id} joined session {session_code}")
+        logger.info(f"Host {user_id} joined session {session_code}")
         
         # Prepare session payload with participants as list
         session_payload = {**session}
@@ -142,7 +140,6 @@ async def handle_join(websocket: WebSocket, session_code: str, user_id: str, pay
     
     # Check if session is still accepting new participants
     if session["status"] != "waiting" and not is_reconnecting:
-        logger.warning(f"❌ Session {session_code} is {session['status']}, cannot accept new participants")
         await manager.send_personal_message({"type": "error", "payload": {"message": "Session is already active"}}, websocket)
         return
     
@@ -150,7 +147,7 @@ async def handle_join(websocket: WebSocket, session_code: str, user_id: str, pay
     success = await session_manager.add_participant(session_code, user_id, username)
     
     if success:
-        logger.info(f"✅ {'Reconnected' if is_reconnecting else 'Added'} {username} to session {session_code}")
+        logger.info(f"{'Reconnected' if is_reconnecting else 'Added'} {username} to session {session_code}")
         
         # Broadcast update to all
         session = await session_manager.get_session(session_code)
@@ -177,7 +174,6 @@ async def handle_join(websocket: WebSocket, session_code: str, user_id: str, pay
         
         # If reconnecting during active quiz, send current question
         if is_reconnecting and session["status"] == "active":
-            logger.debug(f"🎮 Sending current question to reconnecting user {user_id}")
             question_data = await game_controller.get_current_question(session_code)
             if question_data:
                 await manager.send_personal_message({
@@ -185,7 +181,7 @@ async def handle_join(websocket: WebSocket, session_code: str, user_id: str, pay
                     "payload": question_data
                 }, websocket)
     else:
-        logger.error(f"❌ Failed to add {username} to session {session_code}")
+        logger.error(f"Failed to add {username} to session {session_code}")
 
 
 async def auto_advance_question(session_code: str, time_limit: int, question_index: int):
@@ -196,17 +192,15 @@ async def auto_advance_question(session_code: str, time_limit: int, question_ind
         # Check if session is still active
         session = await session_manager.get_session(session_code)
         if not session or session.get("status") != "active":
-            logger.info(f"⏰ AUTO_ADVANCE - Session {session_code} no longer active, skipping")
             return
         
         # Check if we're still on the same question
         from app.core.database import redis_client
         current_index = await redis_client.hget(f"session:{session_code}", "current_question_index")
         if current_index and int(current_index) != question_index:
-            logger.info(f"⏰ AUTO_ADVANCE - Session {session_code} already moved past question {question_index}, skipping")
             return
         
-        logger.info(f"⏰ AUTO_ADVANCE - Time expired for session {session_code} question {question_index}, advancing...")
+        logger.debug(f"Auto-advancing session {session_code} past Q{question_index}")
         
         # Get next question
         question_data = await game_controller.next_question(session_code)
@@ -217,7 +211,6 @@ async def auto_advance_question(session_code: str, time_limit: int, question_ind
                 "type": "question",
                 "payload": question_data
             }, session_code)
-            logger.info(f"✅ AUTO_ADVANCE - Sent next question to session {session_code}")
             
             # Start timer for next question
             next_time_limit = question_data.get("time_limit", time_limit)
@@ -227,7 +220,7 @@ async def auto_advance_question(session_code: str, time_limit: int, question_ind
             )
         else:
             # No more questions - end quiz
-            logger.info(f"🏁 AUTO_ADVANCE - No more questions, ending quiz for session {session_code}")
+            logger.info(f"Quiz ended for session {session_code}")
             await session_manager.end_session(session_code)
             
             # Get final results
@@ -242,7 +235,7 @@ async def auto_advance_question(session_code: str, time_limit: int, question_ind
                 }
             }, session_code)
     except Exception as e:
-        logger.error(f"❌ AUTO_ADVANCE - Error: {e}")
+        logger.error(f"Auto-advance error: {e}")
 
 
 async def handle_start_quiz(websocket: WebSocket, session_code: str, user_id: str, payload: dict = None):
@@ -263,7 +256,6 @@ async def handle_start_quiz(websocket: WebSocket, session_code: str, user_id: st
         # Update session with time settings
         from app.core.database import redis_client
         await redis_client.hset(f"session:{session_code}", "per_question_time_limit", per_question_time_limit)
-        logger.info(f"⏱️ Updated time settings: per_question={per_question_time_limit}s")
     
     # Start the quiz - update session status
     success = await session_manager.start_session(session_code, user_id)
@@ -280,7 +272,6 @@ async def handle_start_quiz(websocket: WebSocket, session_code: str, user_id: st
     
     for participant_id in participants.keys():
         await game_controller.set_participant_question_index(session_code, participant_id, 0)
-        logger.info(f"📝 Initialized participant {participant_id} to question 0")
     
     # Start the question timer
     await game_controller.start_question_timer(session_code)
@@ -330,17 +321,11 @@ async def handle_submit_answer(websocket: WebSocket, session_code: str, user_id:
         
         # Allow null answers for timeouts
         if answer is None and not is_timeout:
-            logger.debug(f"❌ ANSWER - No answer provided in payload: {payload}")
             await manager.send_personal_message({
                 "type": "error",
                 "payload": {"message": "Invalid answer submission"}
             }, websocket)
             return
-        
-        if is_timeout:
-            logger.debug(f"⏰ ANSWER - User {user_id} timed out (no answer submitted)")
-        else:
-            logger.debug(f"📝 ANSWER - User {user_id} submitted answer: {answer}")
         
         # Process answer
         result = await game_controller.submit_answer(
@@ -349,16 +334,11 @@ async def handle_submit_answer(websocket: WebSocket, session_code: str, user_id:
         
         # Check for errors
         if "error" in result:
-            logger.debug(f"⚠️ ANSWER - Error for {user_id}: {result['error']}")
             await manager.send_personal_message({
                 "type": "answer_result",
                 "payload": result
             }, websocket)
             return
-        
-        is_correct = result.get('is_correct', False)
-        points = result.get('points', 0)
-        logger.debug(f"{'✅' if is_correct else '❌'} ANSWER - Result for {user_id}: {'CORRECT' if is_correct else 'INCORRECT'}, Points: {points}")
         
         # Send result to participant
         await manager.send_personal_message({
@@ -370,18 +350,13 @@ async def handle_submit_answer(websocket: WebSocket, session_code: str, user_id:
         # This ensures the host sees real-time progress
         leaderboard = await leaderboard_manager.get_leaderboard(session_code)
         
-        # Log summary of leaderboard being sent
-        if leaderboard:
-            summary = [(e['username'], e['answered_count'], e['score']) for e in leaderboard[:5]]
-            logger.info(f"🏆 LEADERBOARD BROADCAST - Top 5: {summary}")
-        
         await manager.broadcast_to_session({
             "type": "leaderboard_update",
             "payload": {"leaderboard": leaderboard}
         }, session_code)
     
     except Exception as e:
-        logger.error(f"❌ ANSWER - Error processing answer for {user_id}: {e}", exc_info=True)
+        logger.error(f"Error processing answer for {user_id}: {e}", exc_info=True)
         try:
             await manager.send_personal_message({
                 "type": "error",
@@ -410,7 +385,6 @@ async def handle_next_question(websocket: WebSocket, session_code: str, user_id:
         if timer_key in active_timers:
             active_timers[timer_key].cancel()
             del active_timers[timer_key]
-            logger.info(f"⏰ Cancelled auto-advance timer for question {current_index}")
     
     # Get next question
     question_data = await game_controller.next_question(session_code)
@@ -429,7 +403,6 @@ async def handle_next_question(websocket: WebSocket, session_code: str, user_id:
         active_timers[timer_key] = asyncio.create_task(
             auto_advance_question(session_code, time_limit, next_index)
         )
-        logger.info(f"⏰ Started auto-advance timer for question {next_index} ({time_limit}s)")
     else:
         # No more questions - quiz complete
         await handle_end_quiz(websocket, session_code, user_id)
@@ -442,25 +415,20 @@ async def handle_request_next_question(websocket: WebSocket, session_code: str, 
     So we just need to fetch the question at their current index.
     """
     try:
-        logger.debug(f"📨 SELF_PACED - Participant {user_id} requesting next question")
-        
         # Get participant's current index (already advanced after answering)
         current_index = await game_controller.get_participant_question_index(session_code, user_id)
         total_questions = await game_controller.get_total_questions(session_code)
         
         if total_questions == 0:
-            logger.error(f"❌ SELF_PACED - No questions found for session {session_code}")
             await manager.send_personal_message({
                 "type": "error",
                 "payload": {"message": "Quiz not found"}
             }, websocket)
             return
         
-        logger.debug(f"📊 SELF_PACED - Current index for {user_id}: {current_index}/{total_questions}")
-        
         # Check if participant has completed all questions
         if current_index >= total_questions:
-            logger.info(f"🏁 SELF_PACED - Participant {user_id} has completed all questions!")
+            logger.info(f"Participant {user_id} completed all questions")
             
             # Get final results
             final_results = await leaderboard_manager.get_final_results(session_code)
@@ -487,10 +455,9 @@ async def handle_request_next_question(websocket: WebSocket, session_code: str, 
                 "type": "question",
                 "payload": question_data
             }, websocket)
-            logger.debug(f"✅ SELF_PACED - Sent Q{current_index + 1}/{total_questions} to {user_id}")
         else:
             # No more questions - participant finished
-            logger.info(f"🏁 SELF_PACED - Participant {user_id} completed all questions!")
+            logger.info(f"Participant {user_id} completed all questions")
             
             # Get final results
             final_results = await leaderboard_manager.get_final_results(session_code)
@@ -508,7 +475,7 @@ async def handle_request_next_question(websocket: WebSocket, session_code: str, 
             await check_all_participants_completed(session_code, total_questions)
     
     except Exception as e:
-        logger.error(f"❌ SELF_PACED - Error for {user_id}: {e}", exc_info=True)
+        logger.error(f"Error getting next question for {user_id}: {e}", exc_info=True)
         try:
             await manager.send_personal_message({
                 "type": "error",
@@ -539,17 +506,13 @@ async def check_all_participants_completed(session_code: str, total_questions: i
         
         for participant_id in participants.keys():
             participant_index = await game_controller.get_participant_question_index(session_code, participant_id)
-            # Participant has completed if their index >= total_questions
-            # (index is advanced to total_questions after answering the last question)
             if participant_index >= total_questions:
                 completed_count += 1
             else:
                 all_completed = False
         
-        logger.debug(f"📊 COMPLETION CHECK - {completed_count}/{len(participants)} completed in session {session_code}")
-        
         if all_completed:
-            logger.info(f"🎉 ALL PARTICIPANTS COMPLETED! Broadcasting quiz_ended to session {session_code}")
+            logger.info(f"All {completed_count} participants completed session {session_code}")
             
             # Mark session as completed
             await session_manager.end_session(session_code)
@@ -565,10 +528,9 @@ async def check_all_participants_completed(session_code: str, total_questions: i
                     "results": final_results
                 }
             }, session_code)
-            logger.info(f"✅ Broadcasted quiz_ended with final results to session {session_code}")
     
     except Exception as e:
-        logger.error(f"❌ COMPLETION CHECK - Error: {e}", exc_info=True)
+        logger.error(f"Completion check error: {e}", exc_info=True)
 
 
 async def handle_end_quiz(websocket: WebSocket, session_code: str, user_id: str):
@@ -646,4 +608,4 @@ async def handle_request_leaderboard(websocket: WebSocket, session_code: str, us
         }, websocket)
     
     except Exception as e:
-        logger.error(f"❌ LEADERBOARD_REQUEST - Error: {e}", exc_info=True)
+        logger.error(f"Leaderboard request error: {e}", exc_info=True)

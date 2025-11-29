@@ -42,7 +42,7 @@ class ConnectionManager:
             # Remove from dead connections if present
             self._dead_connections.discard(user_id)
             
-            logger.info(f"✅ User {user_id} connected to session {session_code} (host={is_host}). Total in session: {len(self.session_connections[session_code])}")
+            logger.info(f"User {user_id} connected to session {session_code} (host={is_host}). Total: {len(self.session_connections[session_code])}")
 
     def disconnect(self, websocket: WebSocket, session_code: str, user_id: str):
         """Remove a WebSocket connection (sync for use in finally block)"""
@@ -77,7 +77,7 @@ class ConnectionManager:
             await asyncio.wait_for(websocket.send_json(message), timeout=5.0)
             return True
         except asyncio.TimeoutError:
-            logger.warning(f"⏰ Send timeout for user {user_id}")
+            logger.warning(f"Send timeout for user {user_id}")
             return False
         except Exception as e:
             logger.debug(f"Send failed for {user_id}: {type(e).__name__}")
@@ -131,7 +131,7 @@ class ConnectionManager:
         
         # Clean up dead connections
         if dead_users:
-            logger.info(f"🧹 Cleaning up {len(dead_users)} dead connections from session {session_code}")
+            logger.debug(f"Cleaning up {len(dead_users)} dead connections from session {session_code}")
             for user_id in dead_users:
                 if session_code in self.session_connections:
                     if user_id in self.session_connections[session_code]:

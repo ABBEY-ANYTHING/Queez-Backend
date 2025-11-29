@@ -134,11 +134,11 @@ class SessionManager:
                             "score": 0,
                             "answers": []
                         }
-                        logger.debug(f"🆕 New participant {username} ({user_id})")
+                        logger.debug(f"New participant {username} ({user_id})")
                     
                     # Save updated participants
                     await self.redis.hset(session_key, "participants", json.dumps(participants))
-                    logger.debug(f"✅ Session {session_code} now has {len(participants)} participants")
+                    logger.debug(f"Session {session_code} now has {len(participants)} participants")
                     return True
                     
                 finally:
@@ -146,7 +146,7 @@ class SessionManager:
                     await self.redis.delete(lock_key)
                     
             except Exception as e:
-                logger.error(f"❌ Error adding participant {user_id} (attempt {attempt + 1}): {e}")
+                logger.error(f"Error adding participant {user_id} (attempt {attempt + 1}): {e}")
                 # Try to release lock in case of error
                 try:
                     await self.redis.delete(lock_key)
@@ -157,7 +157,7 @@ class SessionManager:
                 await asyncio.sleep(random.uniform(0.01, 0.05))
                 continue
         
-        logger.error(f"❌ Failed to add participant {user_id} after {max_retries} attempts (could not acquire lock)")
+        logger.error(f"Failed to add participant {user_id} after {max_retries} attempts")
         return False
 
     async def remove_participant(self, session_code: str, user_id: str):
@@ -172,19 +172,18 @@ class SessionManager:
 
     async def start_session(self, session_code: str, host_id: str) -> bool:
         """Transition session to active state"""
-        logger.info(f"🎮 Starting session {session_code} by host {host_id}")
+        logger.info(f"Starting session {session_code} by host {host_id}")
         
         session = await self.get_session(session_code)
         if not session:
-            logger.error(f"❌ Session {session_code} not found!")
+            logger.error(f"Session {session_code} not found")
             return False
             
         if session["host_id"] != host_id:
-            logger.error(f"❌ User {host_id} is not the host (actual host: {session['host_id']})")
+            logger.error(f"User {host_id} is not the host (actual host: {session['host_id']})")
             return False
         
-        logger.info(f"✅ Setting session {session_code} status to 'active'")
-        logger.info(f"📊 Session data: quiz_id={session.get('quiz_id')}, participants={len(session.get('participants', {}))}")
+        logger.info(f"Session {session_code} starting: quiz_id={session.get('quiz_id')}, participants={len(session.get('participants', {}))}")
         
         # Set status to active and record quiz start time
         await self.redis.hset(f"session:{session_code}", mapping={

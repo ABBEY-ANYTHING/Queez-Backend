@@ -32,13 +32,16 @@ class LeaderboardManager:
         
         # Build leaderboard data
         leaderboard = []
+        incomplete_users = []
+        
         for user_id, participant in participants.items():
             # Count answered questions from the answers array
             answers = participant.get("answers", [])
             answered_count = len(answers)
             
-            # Log detailed info for debugging
-            logger.info(f"📊 LEADERBOARD - {participant.get('username', 'Unknown')}: answered_count={answered_count}, score={participant.get('score', 0)}, answers_indices={[a.get('question_index') for a in answers]}")
+            # Track users who haven't finished for debugging
+            if answered_count < total_questions:
+                incomplete_users.append(f"{participant.get('username', 'Unknown')}={answered_count}/{total_questions}")
             
             leaderboard.append({
                 "user_id": user_id,
@@ -49,6 +52,10 @@ class LeaderboardManager:
                 "current_question": current_index + 1,
                 "is_connected": participant.get("connected", False),
             })
+        
+        # Log summary instead of per-user details
+        if incomplete_users:
+            logger.debug(f"Leaderboard: {len(leaderboard)} users, {len(incomplete_users)} incomplete: {incomplete_users[:5]}{'...' if len(incomplete_users) > 5 else ''}")
         
         # Sort by score (descending), then by answered_count (ascending - faster is better)
         leaderboard.sort(key=lambda x: (-x["score"], x["answered_count"]))
