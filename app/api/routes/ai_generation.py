@@ -167,7 +167,7 @@ async def generate_study_set(
         genai.configure(api_key=api_key)
         
         # Initialize Gemini model
-        model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20')
+        model = genai.GenerativeModel('gemini-2.5-flash')
         
         logger.info(f"Generating AI study set from {len(request.fileUris)} files")
         logger.info(f"Settings: {request.settings.quizCount} quizzes, {request.settings.flashcardSetCount} flashcard sets, {request.settings.noteCount} notes")
