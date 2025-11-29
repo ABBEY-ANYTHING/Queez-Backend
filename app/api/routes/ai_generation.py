@@ -19,7 +19,7 @@ router = APIRouter(
 upload_tokens = {}
 
 class UploadTokenResponse(BaseModel):
-    uploadToken: str
+    uploadUrl: str
     expiresAt: str
 
 class GenerationSettings(BaseModel):
@@ -42,41 +42,82 @@ class GenerateStudySetRequest(BaseModel):
     config: StudySetConfig
     settings: GenerationSettings
 
-@router.get("/get-upload-token", response_model=UploadTokenResponse)
-async def get_upload_token(
+@router.post("/get-upload-url")
+async def get_upload_url(
+    file_name: str,
+    mime_type: str,
     authorization: Optional[str] = Header(None)
 ):
     """
-    Generate a temporary upload token for Gemini File API
-    Token is valid for 10 minutes
+    Generate a temporary resumable upload URL for Gemini File API
+    This keeps the API key secure on the server
     """
     try:
         # Verify Firebase auth token
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Unauthorized")
         
-        # Extract user ID from token (for production, verify with Firebase Admin SDK)
-        # For now, we'll just generate a token
-        token = secrets.token_urlsafe(32)
-        expiration = datetime.utcnow() + timedelta(minutes=10)
+        # Import requests for making HTTP calls
+        import requests
         
-        # Store token with expiration
-        upload_tokens[token] = {
-            "created_at": datetime.utcnow(),
-            "expires_at": expiration
+        # Get Gemini API key from environment
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            logger.error("GEMINI_API_KEY environment variable not set")
+            raise HTTPException(
+                status_code=500,
+                detail="AI service configuration missing"
+            )
+        
+        # Request a resumable upload URL from Gemini
+        headers = {
+            "X-Goog-Upload-Protocol": "resumable",
+            "X-Goog-Upload-Command": "start",
+            "X-Goog-Upload-Header-Content-Type": mime_type,
+            "Content-Type": "application/json"
         }
         
-        logger.info(f"Generated upload token: {token[:8]}... expires at {expiration}")
+        metadata = {
+            "file": {
+                "display_name": file_name
+            }
+        }
         
-        return UploadTokenResponse(
-            uploadToken=token,
-            expiresAt=expiration.isoformat() + "Z"
+        response = requests.post(
+            f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={api_key}",
+            headers=headers,
+            json=metadata,
+            timeout=30
         )
+        
+        if response.status_code != 200:
+            logger.error(f"Failed to get upload URL: {response.text}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to create upload session: {response.text}"
+            )
+        
+        # Extract upload URL from response headers
+        upload_url = response.headers.get("X-Goog-Upload-URL")
+        if not upload_url:
+            raise HTTPException(
+                status_code=500,
+                detail="No upload URL returned from Gemini"
+            )
+        
+        expiration = datetime.utcnow() + timedelta(hours=1)
+        
+        logger.info(f"Generated upload URL for file: {file_name}")
+        
+        return {
+            "uploadUrl": upload_url,
+            "expiresAt": expiration.isoformat() + "Z"
+        }
     
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error generating upload token: {str(e)}")
+        logger.error(f"Error generating upload URL: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/generate-study-set")
