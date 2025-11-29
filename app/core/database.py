@@ -30,3 +30,7 @@ redis_client = redis.from_url(
     decode_responses=True,
     ssl_cert_reqs=ssl.CERT_NONE if REDIS_URL.startswith("rediss://") else None
 )
+
+async def get_redis():
+    """Get the Redis client instance. Used for dependency injection."""
+    return redis_client
