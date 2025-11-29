@@ -166,8 +166,8 @@ async def generate_study_set(
         
         genai.configure(api_key=api_key)
         
-        # Initialize Gemini model (using 1.5-flash for better rate limits)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # Initialize Gemini model
+        model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20')
         
         logger.info(f"Generating AI study set from {len(request.fileUris)} files")
         logger.info(f"Settings: {request.settings.quizCount} quizzes, {request.settings.flashcardSetCount} flashcard sets, {request.settings.noteCount} notes")
@@ -273,10 +273,6 @@ IMPORTANT: Return ONLY valid JSON without any markdown formatting or code blocks
         )
         
         # Parse response
-        import json
-        import uuid
-        from datetime import datetime
-        
         response_text = response.text
         
         # Extract JSON from markdown code blocks if present
