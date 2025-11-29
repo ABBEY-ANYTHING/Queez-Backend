@@ -37,6 +37,10 @@ class StudySetConfig(BaseModel):
     language: str
     coverImagePath: Optional[str] = None
 
+class UploadUrlRequest(BaseModel):
+    file_name: str
+    mime_type: str
+
 class GenerateStudySetRequest(BaseModel):
     fileUris: List[str]
     config: StudySetConfig
@@ -44,8 +48,7 @@ class GenerateStudySetRequest(BaseModel):
 
 @router.post("/get-upload-url")
 async def get_upload_url(
-    file_name: str,
-    mime_type: str,
+    request: UploadUrlRequest,
     authorization: Optional[str] = Header(None)
 ):
     """
@@ -73,13 +76,13 @@ async def get_upload_url(
         headers = {
             "X-Goog-Upload-Protocol": "resumable",
             "X-Goog-Upload-Command": "start",
-            "X-Goog-Upload-Header-Content-Type": mime_type,
+            "X-Goog-Upload-Header-Content-Type": request.mime_type,
             "Content-Type": "application/json"
         }
         
         metadata = {
             "file": {
-                "display_name": file_name
+                "display_name": request.file_name
             }
         }
         
@@ -107,7 +110,7 @@ async def get_upload_url(
         
         expiration = datetime.utcnow() + timedelta(hours=1)
         
-        logger.info(f"Generated upload URL for file: {file_name}")
+        logger.info(f"Generated upload URL for file: {request.file_name}")
         
         return {
             "uploadUrl": upload_url,
