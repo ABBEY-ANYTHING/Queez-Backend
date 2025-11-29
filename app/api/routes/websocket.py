@@ -369,11 +369,16 @@ async def handle_submit_answer(websocket: WebSocket, session_code: str, user_id:
         # ✅ ALWAYS broadcast leaderboard after each answer
         # This ensures the host sees real-time progress
         leaderboard = await leaderboard_manager.get_leaderboard(session_code)
+        
+        # Log summary of leaderboard being sent
+        if leaderboard:
+            summary = [(e['username'], e['answered_count'], e['score']) for e in leaderboard[:5]]
+            logger.info(f"🏆 LEADERBOARD BROADCAST - Top 5: {summary}")
+        
         await manager.broadcast_to_session({
             "type": "leaderboard_update",
             "payload": {"leaderboard": leaderboard}
         }, session_code)
-        logger.debug(f"🏆 LEADERBOARD - Broadcasted to session {session_code}")
     
     except Exception as e:
         logger.error(f"❌ ANSWER - Error processing answer for {user_id}: {e}", exc_info=True)

@@ -148,20 +148,19 @@ class GameController:
         return {"error": "Failed to process answer after multiple attempts"}
 
     async def _process_answer_internal(self, session_code: str, user_id: str, answer: Any, timestamp: float) -> Dict[str, Any]:
-        """Internal answer processing (called with lock held)"""
+        """Internal answer processing (called with per-user lock held)
+        
+        CRITICAL: We need a session-wide lock for participants updates to prevent
+        race conditions where concurrent answers overwrite each other.
+        """
         session_key = f"session:{session_code}"
         cache_key = f"quiz_cache:{session_code}"
+        participants_lock_key = f"lock:participants:{session_code}"
         
         # Get participant's current question index
         current_index = await self.get_participant_question_index(session_code, user_id)
         
-        logger.debug(f"📝 Processing answer for user {user_id} on question {current_index}")
-        
-        # Get session state (participants)
-        participants_json = await self.redis.hget(session_key, "participants")
-        
-        if not participants_json:
-            return {"error": "Session not found"}
+        logger.info(f"📝 Processing answer for {user_id} on Q{current_index + 1}")
 
         # Try to get quiz from cache first
         cached_quiz = await self.redis.get(cache_key)
@@ -290,69 +289,121 @@ class GameController:
             
             points = base_points + time_bonus
         
-        # Update participant data
-        participants = json.loads(participants_json)
-        if user_id in participants:
-            participant = participants[user_id]
+        # ============================================================
+        # CRITICAL SECTION: Update participant data with session-wide lock
+        # This prevents race conditions where concurrent answers overwrite each other
+        # ============================================================
+        participants_lock_key = f"lock:participants:{session_code}"
+        max_lock_retries = 50
+        lock_timeout = 3
+        
+        for lock_attempt in range(max_lock_retries):
+            # Try to acquire session-wide participants lock
+            lock_acquired = await self.redis.set(
+                participants_lock_key,
+                user_id,
+                nx=True,
+                ex=lock_timeout
+            )
             
-            # Check if already answered
-            for ans in participant["answers"]:
-                if ans["question_index"] == current_index:
-                    logger.warning(f"⚠️ User {user_id} already answered question {current_index}")
-                    return {"error": "Already answered"}
+            if not lock_acquired:
+                await asyncio.sleep(0.02 * (lock_attempt + 1))
+                continue
             
-            # Record answer
-            participant["answers"].append({
-                "question_index": current_index,
-                "answer": answer,
-                "timestamp": timestamp,
-                "is_correct": is_correct,
-                "points_earned": points
-            })
-            participant["score"] += points
-            
-            # Save back to Redis
-            await self.redis.hset(session_key, "participants", json.dumps(participants))
-            
-            logger.debug(f"💾 Saved answer for {user_id}: Q{current_index}, score={participant['score']}")
-            
-            # Return correct answer based on question type
-            correct_answer_response = None
-            if question_type in ["singleMcq", "trueFalse"]:
-                correct_answer_response = str(question.get("correctAnswerIndex"))
-            elif question_type == "multiMcq":
-                correct_answer_response = question.get("correctAnswerIndices", [])
-            elif question_type == "dragAndDrop":
-                correct_answer_response = question.get("correctMatches", {})
-            
-            # Store the answer for returning
-            stored_answer = answer
-            
-            response = {
-                "is_correct": is_correct,
-                "points": points,
-                "time_bonus": time_bonus,
-                "multiplier": round(multiplier, 2),
-                "correct_answer": correct_answer_response,
-                "user_answer": stored_answer,
-                "new_total_score": participant["score"],
-                "question_type": question_type,
-                "question_index": current_index
-            }
-            
-            # Add partial credit info for multi-choice
-            if question_type == "multiMcq":
-                response["partial_credit"] = round(partial_credit_percentage, 1)
-                response["is_partial"] = partial_credit_percentage > 0 and partial_credit_percentage < 100
-            
-            # ✅ ADVANCE participant's question index immediately after answering
-            # This way request_next_question just needs to get the next question
-            await self.set_participant_question_index(session_code, user_id, current_index + 1)
-            
-            return response
-            
-        logger.error(f"❌ Participant {user_id} not found in session")
-        return {"error": "Participant not found"}
+            try:
+                # === LOCKED: Read-modify-write participants ===
+                participants_json = await self.redis.hget(session_key, "participants")
+                if not participants_json:
+                    return {"error": "Session not found"}
+                
+                participants = json.loads(participants_json)
+                if user_id not in participants:
+                    logger.error(f"❌ Participant {user_id} not found in session")
+                    return {"error": "Participant not found"}
+                
+                participant = participants[user_id]
+                
+                # Check if already answered
+                for ans in participant["answers"]:
+                    if ans["question_index"] == current_index:
+                        logger.warning(f"⚠️ User {user_id} already answered question {current_index}")
+                        return {"error": "Already answered"}
+                
+                # Record answer
+                participant["answers"].append({
+                    "question_index": current_index,
+                    "answer": answer,
+                    "timestamp": timestamp,
+                    "is_correct": is_correct,
+                    "points_earned": points
+                })
+                participant["score"] += points
+                
+                # Log BEFORE saving
+                answers_count = len(participant["answers"])
+                logger.info(f"💾 SAVING - {user_id}: Q{current_index + 1}, answers={answers_count}, score={participant['score']}")
+                
+                # Save back to Redis
+                await self.redis.hset(session_key, "participants", json.dumps(participants))
+                
+                # === END LOCKED SECTION ===
+                break
+                
+            finally:
+                # Always release the lock
+                await self.redis.delete(participants_lock_key)
+        else:
+            # Failed to acquire lock after all retries
+            logger.error(f"❌ Failed to acquire participants lock for {user_id}")
+            return {"error": "Server busy, please try again"}
+        
+        # Verify save by reading back (outside lock for performance)
+        verify_json = await self.redis.hget(session_key, "participants")
+        verify_participants = json.loads(verify_json)
+        if user_id in verify_participants:
+            verify_count = len(verify_participants[user_id].get("answers", []))
+            if verify_count != answers_count:
+                logger.error(f"❌ MISMATCH - {user_id}: expected {answers_count}, got {verify_count} in Redis!")
+            else:
+                logger.info(f"✅ VERIFIED - {user_id}: {verify_count} answers in Redis")
+        
+        # Return correct answer based on question type
+        correct_answer_response = None
+        if question_type in ["singleMcq", "trueFalse"]:
+            correct_answer_response = str(question.get("correctAnswerIndex"))
+        elif question_type == "multiMcq":
+            correct_answer_response = question.get("correctAnswerIndices", [])
+        elif question_type == "dragAndDrop":
+            correct_answer_response = question.get("correctMatches", {})
+        
+        # Store the answer for returning
+        stored_answer = answer
+        
+        # Get the updated score from what we saved
+        final_score = participant["score"]
+        
+        response = {
+            "is_correct": is_correct,
+            "points": points,
+            "time_bonus": time_bonus,
+            "multiplier": round(multiplier, 2),
+            "correct_answer": correct_answer_response,
+            "user_answer": stored_answer,
+            "new_total_score": final_score,
+            "question_type": question_type,
+            "question_index": current_index
+        }
+        
+        # Add partial credit info for multi-choice
+        if question_type == "multiMcq":
+            response["partial_credit"] = round(partial_credit_percentage, 1)
+            response["is_partial"] = partial_credit_percentage > 0 and partial_credit_percentage < 100
+        
+        # ✅ ADVANCE participant's question index immediately after answering
+        # This way request_next_question just needs to get the next question
+        await self.set_participant_question_index(session_code, user_id, current_index + 1)
+        
+        return response
 
     async def advance_question(self, session_code: str) -> bool:
         """Move to the next question"""

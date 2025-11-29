@@ -33,8 +33,12 @@ class LeaderboardManager:
         # Build leaderboard data
         leaderboard = []
         for user_id, participant in participants.items():
-            # Count answered questions
-            answered_count = len(participant.get("answers", []))
+            # Count answered questions from the answers array
+            answers = participant.get("answers", [])
+            answered_count = len(answers)
+            
+            # Log detailed info for debugging
+            logger.info(f"📊 LEADERBOARD - {participant.get('username', 'Unknown')}: answered_count={answered_count}, score={participant.get('score', 0)}, answers_indices={[a.get('question_index') for a in answers]}")
             
             leaderboard.append({
                 "user_id": user_id,
