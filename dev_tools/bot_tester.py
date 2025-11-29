@@ -251,35 +251,75 @@ class QuizBot:
             self._log("👋 Disconnected")
 
 
-async def run_bots(session_code: str, num_bots: int):
-    """Run multiple bots in a session"""
+async def run_bots(session_code: str, num_bots: int, batch_size: int = 10, batch_delay: float = 1.0):
+    """Run multiple bots in a session - optimized for free tier hosting"""
     print("\n" + "="*60)
     print(f"🤖 QUIZ BOT TESTER - Starting {num_bots} bots")
     print(f"📍 Session Code: {session_code}")
     print(f"🎯 Accuracy Range: {BOT_ACCURACY_MIN*100:.0f}% - {BOT_ACCURACY_MAX*100:.0f}%")
     print(f"⏱️ Response Time: {RESPONSE_TIME_MIN}s - {RESPONSE_TIME_MAX}s")
+    print(f"📦 Batch Size: {batch_size} bots per batch")
+    print(f"⏳ Batch Delay: {batch_delay}s between batches")
     print("="*60 + "\n")
     
     # Create bots
     bots = [QuizBot(i + 1, session_code) for i in range(num_bots)]
     
-    # Connect all bots
-    print("📡 Connecting bots...")
-    connect_tasks = [bot.connect() for bot in bots]
-    results = await asyncio.gather(*connect_tasks)
+    # Connect bots in batches to avoid overwhelming the server
+    print("📡 Connecting bots in batches...")
+    connected_bots = []
     
-    connected_bots = [bot for bot, success in zip(bots, results) if success]
-    print(f"✅ {len(connected_bots)}/{num_bots} bots connected\n")
+    for batch_start in range(0, num_bots, batch_size):
+        batch_end = min(batch_start + batch_size, num_bots)
+        batch = bots[batch_start:batch_end]
+        batch_num = (batch_start // batch_size) + 1
+        total_batches = (num_bots + batch_size - 1) // batch_size
+        
+        print(f"  📦 Batch {batch_num}/{total_batches}: Connecting bots {batch_start + 1}-{batch_end}...")
+        
+        # Connect this batch
+        connect_tasks = [bot.connect() for bot in batch]
+        results = await asyncio.gather(*connect_tasks)
+        
+        # Track connected bots
+        for bot, success in zip(batch, results):
+            if success:
+                connected_bots.append(bot)
+        
+        # Wait between batches (except for last batch)
+        if batch_end < num_bots:
+            await asyncio.sleep(batch_delay)
+    
+    print(f"\n✅ {len(connected_bots)}/{num_bots} bots connected\n")
     
     if not connected_bots:
         print("❌ No bots connected. Check your session code and server URL.")
         return
     
-    # Join session
-    print("🚪 Bots joining session...")
-    join_tasks = [bot.join_session() for bot in connected_bots]
-    await asyncio.gather(*join_tasks)
+    # Join session in batches with staggered timing
+    print("🚪 Bots joining session (batched & staggered)...")
     
+    for batch_start in range(0, len(connected_bots), batch_size):
+        batch_end = min(batch_start + batch_size, len(connected_bots))
+        batch = connected_bots[batch_start:batch_end]
+        batch_num = (batch_start // batch_size) + 1
+        total_batches = (len(connected_bots) + batch_size - 1) // batch_size
+        
+        print(f"  📦 Batch {batch_num}/{total_batches}: Joining bots {batch_start + 1}-{batch_end}...")
+        
+        # Join bots in this batch with small delays
+        for i, bot in enumerate(batch):
+            await bot.join_session()
+            # 200ms delay between joins within a batch
+            if i < len(batch) - 1:
+                await asyncio.sleep(0.2)
+        
+        # Wait between batches (except for last batch)
+        if batch_end < len(connected_bots):
+            print(f"  ⏳ Waiting {batch_delay}s before next batch...")
+            await asyncio.sleep(batch_delay)
+    
+    print(f"\n✅ All {len(connected_bots)} bots joined!")
     print("\n⏳ Waiting for host to start the quiz...")
     print("   (Bots will automatically answer questions when quiz starts)\n")
     
@@ -298,9 +338,15 @@ async def run_bots(session_code: str, num_bots: int):
     
     print("="*60 + "\n")
     
-    # Disconnect
-    disconnect_tasks = [bot.disconnect() for bot in connected_bots]
-    await asyncio.gather(*disconnect_tasks)
+    # Disconnect in batches too
+    print("👋 Disconnecting bots...")
+    for batch_start in range(0, len(connected_bots), batch_size):
+        batch_end = min(batch_start + batch_size, len(connected_bots))
+        batch = connected_bots[batch_start:batch_end]
+        disconnect_tasks = [bot.disconnect() for bot in batch]
+        await asyncio.gather(*disconnect_tasks)
+        if batch_end < len(connected_bots):
+            await asyncio.sleep(0.5)
 
 
 def main():
@@ -310,6 +356,10 @@ def main():
     parser.add_argument("session_code", help="Session code to join")
     parser.add_argument("--bots", "-b", type=int, default=DEFAULT_BOT_COUNT, 
                         help=f"Number of bots (default: {DEFAULT_BOT_COUNT})")
+    parser.add_argument("--batch", type=int, default=10,
+                        help="Bots per batch to avoid overwhelming server (default: 10)")
+    parser.add_argument("--delay", type=float, default=1.0,
+                        help="Delay in seconds between batches (default: 1.0)")
     parser.add_argument("--url", "-u", type=str, default=WS_BASE_URL,
                         help=f"WebSocket base URL (default: {WS_BASE_URL})")
     
@@ -318,8 +368,8 @@ def main():
     # Update URL if provided
     WS_BASE_URL = args.url
     
-    # Run bots
-    asyncio.run(run_bots(args.session_code, args.bots))
+    # Run bots with batching
+    asyncio.run(run_bots(args.session_code, args.bots, args.batch, args.delay))
 
 
 if __name__ == "__main__":

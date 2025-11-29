@@ -87,9 +87,9 @@ class SessionManager:
             logger.info(f"Rejected participant join: {user_id} is the host of session {session_code}")
             return False
         
-        # Acquire distributed lock with retry
-        max_retries = 20
-        lock_timeout = 5  # Lock expires after 5 seconds
+        # Acquire distributed lock with retry - tuned for high concurrency (50+ users)
+        max_retries = 100  # More retries for high concurrency
+        lock_timeout = 3   # Shorter lock timeout - operations are fast
         
         for attempt in range(max_retries):
             try:
@@ -98,12 +98,15 @@ class SessionManager:
                     lock_key, 
                     user_id, 
                     nx=True,  # Only set if not exists
-                    ex=lock_timeout  # Expire after 5 seconds
+                    ex=lock_timeout  # Expire after 3 seconds
                 )
                 
                 if not lock_acquired:
-                    # Lock held by another process, wait and retry
-                    await asyncio.sleep(0.05 + (0.02 * attempt))  # 50ms + backoff
+                    # Lock held by another process, wait with jitter and retry
+                    # Random jitter prevents thundering herd
+                    jitter = random.uniform(0.01, 0.05)
+                    wait_time = jitter + (0.01 * min(attempt, 20))  # Cap backoff
+                    await asyncio.sleep(wait_time)
                     continue
                 
                 try:
@@ -151,7 +154,7 @@ class SessionManager:
                     pass
                 if attempt == max_retries - 1:
                     return False
-                await asyncio.sleep(0.05 * (attempt + 1))
+                await asyncio.sleep(random.uniform(0.01, 0.05))
                 continue
         
         logger.error(f"❌ Failed to add participant {user_id} after {max_retries} attempts (could not acquire lock)")
