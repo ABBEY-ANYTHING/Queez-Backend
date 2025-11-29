@@ -1,13 +1,11 @@
 """
 Bot Tester for Live Multiplayer Mode
 =====================================
-Simulates bot users joining and playing in live multiplayer sessions.
+All bots answer each question together, synchronized.
+Waits 2-3 seconds between questions.
 
 Usage:
     python bot_tester.py <session_code> [--bots 5]
-
-Example:
-    python bot_tester.py ABC123 --bots 5
 """
 
 import asyncio
@@ -18,62 +16,45 @@ import argparse
 import websockets
 import ssl
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 # ============================================
-# CONFIGURATION - EDIT THESE VALUES
+# CONFIGURATION
 # ============================================
-
-# WebSocket URL (change to your backend URL)
 WS_BASE_URL = "wss://queez-backend.onrender.com/api/ws"
-# For local testing, use: "ws://localhost:8000/api/ws"
-
-# Number of bots (can be overridden via command line)
 DEFAULT_BOT_COUNT = 5
-
-# Bot answer accuracy (0.0 to 1.0) - 0.75 means 75% correct answers
 BOT_ACCURACY_MIN = 0.6
 BOT_ACCURACY_MAX = 0.9
-
-# Response time range in seconds (bots will answer randomly within this range)
 RESPONSE_TIME_MIN = 1.0
-RESPONSE_TIME_MAX = 8.0
+RESPONSE_TIME_MAX = 4.0
+QUESTION_DELAY = 2.5  # Delay between questions (seconds)
 
-# Bot name prefixes
 BOT_NAMES = ["TestBot", "QuizMaster", "BrainBot", "SmartAI", "QuickBot", 
              "StudyBot", "LearnBot", "FastBot", "CleverBot", "WiseBot"]
 
-# ============================================
-# BOT IMPLEMENTATION
-# ============================================
 
 class QuizBot:
     def __init__(self, bot_id: int, session_code: str):
         self.bot_id = bot_id
         self.session_code = session_code
-        self.user_id = f"bot_{bot_id}_{self._random_string(6)}"
+        self.user_id = f"bot_{bot_id}_{''.join(random.choices(string.ascii_lowercase + string.digits, k=6))}"
         self.username = f"{random.choice(BOT_NAMES)}_{bot_id}"
         self.accuracy = random.uniform(BOT_ACCURACY_MIN, BOT_ACCURACY_MAX)
-        self.websocket: Optional[websockets.WebSocketClientProtocol] = None
+        self.websocket = None
         self.score = 0
         self.questions_answered = 0
         self.correct_answers = 0
         self.is_connected = False
         self.quiz_completed = False
+        self.current_question = None
+        self.waiting_for_result = False
         
-    def _random_string(self, length: int) -> str:
-        return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
-    
     def _log(self, message: str):
         timestamp = datetime.now().strftime("%H:%M:%S")
         print(f"[{timestamp}] 🤖 {self.username}: {message}")
     
     async def connect(self):
-        """Connect to WebSocket server"""
         url = f"{WS_BASE_URL}/{self.session_code}?user_id={self.user_id}"
-        self._log(f"Connecting to {url}")
-        
-        # SSL context for secure connections
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
@@ -86,289 +67,244 @@ class QuizBot:
                 ping_timeout=10
             )
             self.is_connected = True
-            self._log("✅ Connected!")
+            self._log("✅ Connected")
             return True
         except Exception as e:
             self._log(f"❌ Connection failed: {e}")
             return False
     
     async def join_session(self):
-        """Send join message to session"""
         await self._send_message("join", {"username": self.username})
-        self._log(f"Joining session as {self.username}")
+        self._log(f"Joined as {self.username}")
     
-    async def _send_message(self, msg_type: str, payload: Dict = None):
-        """Send a message through WebSocket"""
+    async def _send_message(self, msg_type: str, payload: dict = None):
         if self.websocket and self.is_connected:
             message = {"type": msg_type}
             if payload:
                 message["payload"] = payload
             await self.websocket.send(json.dumps(message))
     
-    def _get_answer_for_question(self, question: Dict) -> Any:
-        """Determine answer based on question type and bot accuracy"""
+    def _get_answer(self, question: dict) -> Any:
         question_type = question.get("type") or question.get("questionType", "singleMcq")
         options = question.get("options", [])
-        
-        # Decide if bot answers correctly
         answer_correctly = random.random() < self.accuracy
         
         if question_type in ["singleMcq", "trueFalse"]:
             correct_index = question.get("correctAnswerIndex", 0)
             if answer_correctly:
                 return correct_index
-            else:
-                # Pick a wrong answer
-                wrong_options = [i for i in range(len(options)) if i != correct_index]
-                return random.choice(wrong_options) if wrong_options else correct_index
-                
+            wrong = [i for i in range(len(options)) if i != correct_index]
+            return random.choice(wrong) if wrong else correct_index
         elif question_type == "multiMcq":
-            correct_indices = question.get("correctAnswerIndices", [0])
+            correct = question.get("correctAnswerIndices", [0])
             if answer_correctly:
-                return correct_indices
-            else:
-                # Return partial or wrong answers
-                all_indices = list(range(len(options)))
-                num_to_select = random.randint(1, len(options))
-                return random.sample(all_indices, min(num_to_select, len(all_indices)))
-                
+                return correct
+            return random.sample(range(len(options)), random.randint(1, len(options)))
         elif question_type == "dragAndDrop":
-            correct_matches = question.get("correctMatches", {})
+            correct = question.get("correctMatches", {})
             if answer_correctly:
-                return correct_matches
-            else:
-                # Shuffle the matches
-                keys = list(correct_matches.keys())
-                values = list(correct_matches.values())
-                random.shuffle(values)
-                return dict(zip(keys, values))
-        
-        # Default fallback
+                return correct
+            keys, values = list(correct.keys()), list(correct.values())
+            random.shuffle(values)
+            return dict(zip(keys, values))
         return 0
     
-    async def handle_question(self, payload: Dict):
-        """Handle incoming question"""
-        question = payload.get("question", {})
-        index = payload.get("index", 0)
-        total = payload.get("total", 1)
-        time_limit = payload.get("time_limit", 30)
+    async def submit_answer(self):
+        """Submit answer for current question"""
+        if not self.current_question:
+            return
+            
+        question = self.current_question.get("question", {})
+        index = self.current_question.get("index", 0)
+        total = self.current_question.get("total", 1)
         
-        question_text = question.get("question", "Unknown question")[:50]
-        question_type = question.get("type") or question.get("questionType", "unknown")
-        
-        self._log(f"📝 Question {index + 1}/{total}: {question_text}... (Type: {question_type})")
-        
-        # Simulate thinking time
-        think_time = random.uniform(RESPONSE_TIME_MIN, min(RESPONSE_TIME_MAX, time_limit - 1))
-        self._log(f"⏳ Thinking for {think_time:.1f}s...")
+        # Think time
+        think_time = random.uniform(RESPONSE_TIME_MIN, RESPONSE_TIME_MAX)
         await asyncio.sleep(think_time)
         
-        # Get answer
-        answer = self._get_answer_for_question(question)
-        
-        # Submit answer
-        await self._send_message("submit_answer", {
-            "answer": answer,
-            "timestamp": think_time
-        })
-        
+        # Submit
+        answer = self._get_answer(question)
+        await self._send_message("submit_answer", {"answer": answer, "timestamp": think_time})
         self.questions_answered += 1
-        self._log(f"📤 Submitted answer: {answer}")
+        self.waiting_for_result = True
+        self._log(f"📤 Answered Q{index + 1}/{total}")
     
-    async def handle_answer_result(self, payload: Dict):
-        """Handle answer result from server"""
-        is_correct = payload.get("is_correct", False)
-        points = payload.get("points", 0)
-        new_score = payload.get("new_total_score", 0)
-        
-        self.score = new_score
-        if is_correct:
-            self.correct_answers += 1
-            self._log(f"✅ Correct! +{points} points (Total: {new_score})")
-        else:
-            self._log(f"❌ Wrong! (Total: {new_score})")
-        
-        # Request next question (self-paced mode)
-        await asyncio.sleep(0.5)
+    async def request_next(self):
+        """Request next question"""
         await self._send_message("request_next_question", {})
     
-    async def handle_quiz_completed(self, payload: Dict):
-        """Handle quiz completion"""
-        self.quiz_completed = True
-        self._log(f"🏁 Quiz completed! Final score: {self.score}")
-        self._log(f"📊 Stats: {self.correct_answers}/{self.questions_answered} correct ({self.accuracy*100:.0f}% target accuracy)")
-    
-    async def listen(self):
-        """Listen for messages from server"""
+    async def listen_loop(self):
+        """Listen for messages"""
         try:
             async for message in self.websocket:
                 data = json.loads(message)
                 msg_type = data.get("type")
                 payload = data.get("payload", {})
                 
-                if msg_type == "session_state":
-                    participant_count = payload.get("participant_count", 0)
-                    participants = payload.get("participants", [])
-                    self._log(f"📋 Received session state - {participant_count} participants: {[p.get('username') for p in participants]}")
+                if msg_type == "question":
+                    self.current_question = payload
+                    q = payload.get("question", {}).get("question", "")[:40]
+                    idx = payload.get("index", 0) + 1
+                    total = payload.get("total", 1)
+                    self._log(f"📝 Q{idx}/{total}: {q}...")
+                    
+                elif msg_type == "answer_result":
+                    self.waiting_for_result = False
+                    is_correct = payload.get("is_correct", False)
+                    points = payload.get("points", 0)
+                    self.score = payload.get("new_total_score", self.score)
+                    if is_correct:
+                        self.correct_answers += 1
+                        self._log(f"✅ +{points} pts")
+                    else:
+                        self._log(f"❌ Wrong")
+                    
+                elif msg_type in ["quiz_completed", "quiz_ended"]:
+                    self.quiz_completed = True
+                    self._log(f"🏁 Done! Score: {self.score}")
+                    
+                elif msg_type == "session_state":
+                    self._log(f"📋 {payload.get('participant_count', 0)} participants")
                     
                 elif msg_type == "quiz_started":
                     self._log("🚀 Quiz started!")
                     
-                elif msg_type == "question":
-                    await self.handle_question(payload)
-                    
-                elif msg_type == "answer_result":
-                    await self.handle_answer_result(payload)
-                    
-                elif msg_type == "quiz_completed" or msg_type == "quiz_ended":
-                    await self.handle_quiz_completed(payload)
-                    break
-                    
-                elif msg_type == "session_update":
-                    participant_count = payload.get("participant_count", 0)
-                    participants = payload.get("participants", [])
-                    self._log(f"📢 Session update - {participant_count} participants: {[p.get('username') for p in participants]}")
-                    
-                elif msg_type == "leaderboard_update":
-                    # Silently handle leaderboard updates
-                    pass
-                    
                 elif msg_type == "error":
-                    self._log(f"⚠️ Error: {payload.get('message', 'Unknown error')}")
+                    self._log(f"⚠️ {payload.get('message', 'Error')}")
                     
         except websockets.exceptions.ConnectionClosed:
-            self._log("🔌 Connection closed")
+            pass
         except Exception as e:
-            self._log(f"❌ Error: {e}")
+            self._log(f"❌ {e}")
         finally:
             self.is_connected = False
     
     async def disconnect(self):
-        """Disconnect from server"""
         if self.websocket:
             await self.websocket.close()
-            self.is_connected = False
             self._log("👋 Disconnected")
 
 
 async def run_bots(session_code: str, num_bots: int, batch_size: int = 10, batch_delay: float = 1.0):
-    """Run multiple bots in a session - optimized for free tier hosting"""
     print("\n" + "="*60)
-    print(f"🤖 QUIZ BOT TESTER - Starting {num_bots} bots")
-    print(f"📍 Session Code: {session_code}")
-    print(f"🎯 Accuracy Range: {BOT_ACCURACY_MIN*100:.0f}% - {BOT_ACCURACY_MAX*100:.0f}%")
-    print(f"⏱️ Response Time: {RESPONSE_TIME_MIN}s - {RESPONSE_TIME_MAX}s")
-    print(f"📦 Batch Size: {batch_size} bots per batch")
-    print(f"⏳ Batch Delay: {batch_delay}s between batches")
+    print(f"🤖 QUIZ BOT TESTER - {num_bots} bots")
+    print(f"📍 Session: {session_code}")
+    print(f"🎯 Accuracy: {BOT_ACCURACY_MIN*100:.0f}%-{BOT_ACCURACY_MAX*100:.0f}%")
+    print(f"⏱️ Response: {RESPONSE_TIME_MIN}-{RESPONSE_TIME_MAX}s")
     print("="*60 + "\n")
     
-    # Create bots
     bots = [QuizBot(i + 1, session_code) for i in range(num_bots)]
-    
-    # Connect bots in batches to avoid overwhelming the server
-    print("📡 Connecting bots in batches...")
     connected_bots = []
     
-    for batch_start in range(0, num_bots, batch_size):
-        batch_end = min(batch_start + batch_size, num_bots)
-        batch = bots[batch_start:batch_end]
-        batch_num = (batch_start // batch_size) + 1
-        total_batches = (num_bots + batch_size - 1) // batch_size
-        
-        print(f"  📦 Batch {batch_num}/{total_batches}: Connecting bots {batch_start + 1}-{batch_end}...")
-        
-        # Connect this batch
-        connect_tasks = [bot.connect() for bot in batch]
-        results = await asyncio.gather(*connect_tasks)
-        
-        # Track connected bots
-        for bot, success in zip(batch, results):
-            if success:
-                connected_bots.append(bot)
-        
-        # Wait between batches (except for last batch)
-        if batch_end < num_bots:
+    # Connect in batches
+    print("📡 Connecting bots...")
+    for i in range(0, num_bots, batch_size):
+        batch = bots[i:i + batch_size]
+        results = await asyncio.gather(*[b.connect() for b in batch])
+        connected_bots.extend([b for b, ok in zip(batch, results) if ok])
+        if i + batch_size < num_bots:
             await asyncio.sleep(batch_delay)
     
-    print(f"\n✅ {len(connected_bots)}/{num_bots} bots connected\n")
-    
+    print(f"✅ {len(connected_bots)}/{num_bots} connected\n")
     if not connected_bots:
-        print("❌ No bots connected. Check your session code and server URL.")
+        print("❌ No bots connected")
         return
     
-    # Join session in batches with staggered timing
-    print("🚪 Bots joining session (batched & staggered)...")
-    
-    for batch_start in range(0, len(connected_bots), batch_size):
-        batch_end = min(batch_start + batch_size, len(connected_bots))
-        batch = connected_bots[batch_start:batch_end]
-        batch_num = (batch_start // batch_size) + 1
-        total_batches = (len(connected_bots) + batch_size - 1) // batch_size
-        
-        print(f"  📦 Batch {batch_num}/{total_batches}: Joining bots {batch_start + 1}-{batch_end}...")
-        
-        # Join bots in this batch with small delays
-        for i, bot in enumerate(batch):
+    # Join in batches
+    print("🚪 Joining session...")
+    for i in range(0, len(connected_bots), batch_size):
+        batch = connected_bots[i:i + batch_size]
+        for bot in batch:
             await bot.join_session()
-            # 200ms delay between joins within a batch
-            if i < len(batch) - 1:
-                await asyncio.sleep(0.2)
-        
-        # Wait between batches (except for last batch)
-        if batch_end < len(connected_bots):
-            print(f"  ⏳ Waiting {batch_delay}s before next batch...")
+            await asyncio.sleep(0.2)
+        if i + batch_size < len(connected_bots):
             await asyncio.sleep(batch_delay)
     
-    print(f"\n✅ All {len(connected_bots)} bots joined!")
-    print("\n⏳ Waiting for host to start the quiz...")
-    print("   (Bots will automatically answer questions when quiz starts)\n")
+    print(f"\n✅ All bots joined!")
+    print("⏳ Waiting for quiz to start...\n")
     
-    # Listen for messages
-    listen_tasks = [bot.listen() for bot in connected_bots]
-    await asyncio.gather(*listen_tasks)
+    # Start listeners
+    listeners = [asyncio.create_task(bot.listen_loop()) for bot in connected_bots]
     
-    # Print final results
+    # Wait for quiz to start (first bot gets a question)
+    while not any(b.current_question for b in connected_bots):
+        await asyncio.sleep(0.5)
+    
+    print("\n🎮 QUIZ IN PROGRESS - All bots answering together\n")
+    
+    # Main quiz loop - all bots answer together
+    while True:
+        # Check if all bots completed
+        if all(b.quiz_completed for b in connected_bots):
+            break
+        
+        # Get bots that have a question and haven't completed
+        active_bots = [b for b in connected_bots if b.current_question and not b.quiz_completed]
+        
+        if not active_bots:
+            await asyncio.sleep(0.5)
+            continue
+        
+        # All active bots submit answers together
+        print(f"📤 {len(active_bots)} bots answering...")
+        await asyncio.gather(*[b.submit_answer() for b in active_bots])
+        
+        # Wait for all results
+        timeout = 10
+        while any(b.waiting_for_result for b in active_bots) and timeout > 0:
+            await asyncio.sleep(0.2)
+            timeout -= 0.2
+        
+        # Delay between questions
+        await asyncio.sleep(QUESTION_DELAY)
+        
+        # All bots request next question together
+        non_completed = [b for b in connected_bots if not b.quiz_completed]
+        if non_completed:
+            print(f"➡️ {len(non_completed)} bots requesting next question...")
+            await asyncio.gather(*[b.request_next() for b in non_completed])
+        
+        # Wait for questions to arrive
+        await asyncio.sleep(1)
+    
+    # All done - wait 15 seconds
     print("\n" + "="*60)
+    print("🏁 ALL BOTS COMPLETED!")
+    print("="*60)
+    print("⏳ Waiting 15 seconds before exit...\n")
+    await asyncio.sleep(15)
+    
+    # Print results
+    print("="*60)
     print("📊 FINAL RESULTS")
     print("="*60)
-    
     for bot in sorted(connected_bots, key=lambda b: b.score, reverse=True):
-        accuracy = (bot.correct_answers / bot.questions_answered * 100) if bot.questions_answered > 0 else 0
-        print(f"  {bot.username}: {bot.score} pts ({bot.correct_answers}/{bot.questions_answered} correct, {accuracy:.0f}%)")
-    
+        acc = (bot.correct_answers / bot.questions_answered * 100) if bot.questions_answered > 0 else 0
+        print(f"  {bot.username}: {bot.score} pts ({bot.correct_answers}/{bot.questions_answered}, {acc:.0f}%)")
     print("="*60 + "\n")
     
-    # Disconnect in batches too
-    print("👋 Disconnecting bots...")
-    for batch_start in range(0, len(connected_bots), batch_size):
-        batch_end = min(batch_start + batch_size, len(connected_bots))
-        batch = connected_bots[batch_start:batch_end]
-        disconnect_tasks = [bot.disconnect() for bot in batch]
-        await asyncio.gather(*disconnect_tasks)
-        if batch_end < len(connected_bots):
-            await asyncio.sleep(0.5)
+    # Cancel listeners and disconnect
+    for task in listeners:
+        task.cancel()
+    
+    print("👋 Disconnecting...")
+    await asyncio.gather(*[b.disconnect() for b in connected_bots])
+    print("✅ Done!")
 
 
 def main():
     global WS_BASE_URL
     
-    parser = argparse.ArgumentParser(description="Quiz Bot Tester for Live Multiplayer")
-    parser.add_argument("session_code", help="Session code to join")
-    parser.add_argument("--bots", "-b", type=int, default=DEFAULT_BOT_COUNT, 
-                        help=f"Number of bots (default: {DEFAULT_BOT_COUNT})")
-    parser.add_argument("--batch", type=int, default=10,
-                        help="Bots per batch to avoid overwhelming server (default: 10)")
-    parser.add_argument("--delay", type=float, default=1.0,
-                        help="Delay in seconds between batches (default: 1.0)")
-    parser.add_argument("--url", "-u", type=str, default=WS_BASE_URL,
-                        help=f"WebSocket base URL (default: {WS_BASE_URL})")
+    parser = argparse.ArgumentParser(description="Quiz Bot Tester")
+    parser.add_argument("session_code", help="Session code")
+    parser.add_argument("--bots", "-b", type=int, default=DEFAULT_BOT_COUNT)
+    parser.add_argument("--batch", type=int, default=10)
+    parser.add_argument("--delay", type=float, default=1.0)
+    parser.add_argument("--url", "-u", type=str, default=WS_BASE_URL)
     
     args = parser.parse_args()
-    
-    # Update URL if provided
     WS_BASE_URL = args.url
     
-    # Run bots with batching
     asyncio.run(run_bots(args.session_code, args.bots, args.batch, args.delay))
 
 
