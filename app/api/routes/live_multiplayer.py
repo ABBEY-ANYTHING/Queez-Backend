@@ -245,3 +245,125 @@ async def validate_session(session_code: str):
     except Exception as e:
         logger.error(f"Error validating session: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error validating session: {str(e)}")
+
+
+@router.get("/user/{user_id}/active-session")
+async def get_user_active_session(user_id: str):
+    """
+    Check if a user has an active session they can rejoin.
+    This is used when the app restarts to resume an in-progress quiz.
+    
+    Returns session info if user is either:
+    - A participant in an active/waiting session
+    - The host of an active/waiting session
+    """
+    from app.core.database import redis_client
+    from app.services.game_controller import GameController
+    
+    try:
+        game_controller = GameController()
+        
+        # Check Redis for user's active session
+        # We store this when user joins a session
+        active_session_key = f"user_active_session:{user_id}"
+        session_code = await redis_client.get(active_session_key)
+        
+        if not session_code:
+            return {
+                "success": True,
+                "has_active_session": False,
+                "message": "No active session found"
+            }
+        
+        # Get session details
+        session = await session_manager.get_session(session_code)
+        
+        if not session:
+            # Session expired, clean up
+            await redis_client.delete(active_session_key)
+            return {
+                "success": True,
+                "has_active_session": False,
+                "message": "Previous session has expired"
+            }
+        
+        # Check if session is still active or waiting
+        status = session.get("status")
+        if status == "completed":
+            # Session ended, clean up
+            await redis_client.delete(active_session_key)
+            return {
+                "success": True,
+                "has_active_session": False,
+                "message": "Previous session has ended",
+                "session_ended": True,
+                "session_code": session_code
+            }
+        
+        # Determine user's role
+        is_host = session.get("host_id") == user_id
+        participants = session.get("participants", {})
+        is_participant = user_id in participants
+        
+        if not is_host and not is_participant:
+            # User is not in this session anymore
+            await redis_client.delete(active_session_key)
+            return {
+                "success": True,
+                "has_active_session": False,
+                "message": "You are no longer in this session"
+            }
+        
+        # Get user's progress if they're a participant
+        user_progress = None
+        if is_participant:
+            participant = participants.get(user_id, {})
+            question_index = await game_controller.get_participant_question_index(session_code, user_id)
+            total_questions = await game_controller.get_total_questions(session_code)
+            
+            user_progress = {
+                "username": participant.get("username", "Anonymous"),
+                "score": participant.get("score", 0),
+                "current_question_index": question_index,
+                "total_questions": total_questions,
+                "answers_count": len(participant.get("answers", [])),
+                "completed": question_index >= total_questions if total_questions > 0 else False
+            }
+        
+        return {
+            "success": True,
+            "has_active_session": True,
+            "session_code": session_code,
+            "status": status,
+            "quiz_title": session.get("quiz_title"),
+            "is_host": is_host,
+            "is_participant": is_participant,
+            "user_progress": user_progress,
+            "participant_count": len(participants)
+        }
+    
+    except Exception as e:
+        logger.error(f"Error checking active session for user {user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error checking active session: {str(e)}")
+
+
+@router.delete("/user/{user_id}/active-session")
+async def clear_user_active_session(user_id: str):
+    """
+    Clear the user's active session tracking.
+    Called when user manually leaves a quiz or session ends.
+    """
+    from app.core.database import redis_client
+    
+    try:
+        active_session_key = f"user_active_session:{user_id}"
+        await redis_client.delete(active_session_key)
+        
+        return {
+            "success": True,
+            "message": "Active session cleared"
+        }
+    
+    except Exception as e:
+        logger.error(f"Error clearing active session for user {user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error clearing active session: {str(e)}")

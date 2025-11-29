@@ -148,8 +148,18 @@ class GameController:
         cache_key = f"quiz_cache:{session_code}"
         participants_lock_key = f"lock:participants:{session_code}"
         
+        # Check if session is still active (not completed)
+        session_status = await self.redis.hget(session_key, "status")
+        if session_status == "completed":
+            return {"error": "Quiz has already ended"}
+        
         # Get participant's current question index
         current_index = await self.get_participant_question_index(session_code, user_id)
+        
+        # Check if user already completed all questions
+        total_questions = await self.get_total_questions(session_code)
+        if total_questions > 0 and current_index >= total_questions:
+            return {"error": "You have already completed all questions"}
         
         logger.debug(f"Processing answer for {user_id} on Q{current_index + 1}")
 
@@ -194,6 +204,17 @@ class GameController:
             if correct_answer is None:
                 logger.error(f"No correct answer for Q{current_index}")
                 return {"error": "Invalid question configuration"}
+            
+            # VALIDATION: Check answer is a valid option index
+            options = question.get("options", [])
+            try:
+                answer_int = int(answer)
+                if answer_int < 0 or answer_int >= len(options):
+                    logger.warning(f"Invalid answer index {answer} from {user_id} (options: {len(options)})")
+                    return {"error": "Invalid answer option"}
+            except (ValueError, TypeError):
+                logger.warning(f"Non-integer answer from {user_id}: {answer}")
+                return {"error": "Invalid answer format"}
             
             is_correct = int(answer) == int(correct_answer)
             
@@ -249,6 +270,22 @@ class GameController:
         
         # Get per-question time limit
         question_time_limit = question.get('timeLimit', QUESTION_TIME_SECONDS)
+        
+        # SECURITY: Validate timestamp to prevent cheating
+        # - Negative timestamps are invalid (exploit attempt)
+        # - Timestamps faster than 0.5 seconds are suspicious (bot/cheat)
+        # - Timestamps beyond time limit get no time bonus
+        MIN_ANSWER_TIME = 0.5  # Minimum realistic human answer time
+        if timestamp is None or timestamp < 0:
+            timestamp = question_time_limit  # Treat as slowest possible
+            logger.warning(f"Invalid timestamp from {user_id}: using max time")
+        elif timestamp < MIN_ANSWER_TIME:
+            # Suspiciously fast - could be a bot, but still award points
+            logger.warning(f"Suspiciously fast answer from {user_id}: {timestamp:.2f}s")
+            timestamp = MIN_ANSWER_TIME  # Cap at minimum
+        elif timestamp > question_time_limit:
+            # Answered after time limit - no time bonus
+            timestamp = question_time_limit
         
         # For multi-choice, use partial credit
         if question_type == "multiMcq" and 'partial_credit' in locals():
@@ -319,7 +356,7 @@ class GameController:
                         logger.debug(f"User {user_id} already answered Q{current_index}")
                         return {"error": "Already answered"}
                 
-                # Record answer
+                # Record answer with validated timestamp
                 participant["answers"].append({
                     "question_index": current_index,
                     "answer": answer,
@@ -327,7 +364,16 @@ class GameController:
                     "is_correct": is_correct,
                     "points_earned": points
                 })
-                participant["score"] += points
+                
+                # Update score with overflow protection
+                MAX_SCORE = 10_000_000  # Prevent integer overflow exploits
+                new_score = participant["score"] + points
+                participant["score"] = min(new_score, MAX_SCORE)
+                
+                # Track total answer time for tie-breaking (faster total time wins)
+                if "total_answer_time" not in participant:
+                    participant["total_answer_time"] = 0.0
+                participant["total_answer_time"] += timestamp
                 
                 # Log BEFORE saving (debug level for production)
                 answers_count = len(participant["answers"])

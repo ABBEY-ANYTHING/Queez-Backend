@@ -16,6 +16,28 @@ logger = logging.getLogger(__name__)
 class SessionManager:
     def __init__(self):
         self.redis = redis_client
+    
+    def _sanitize_username(self, username: str) -> str:
+        """Sanitize username to prevent XSS, empty names, and inappropriate content"""
+        import re
+        
+        if not username or not isinstance(username, str):
+            return "Anonymous"
+        
+        # Strip whitespace and limit length
+        username = username.strip()[:30]
+        
+        # Remove any HTML/script tags (XSS prevention)
+        username = re.sub(r'<[^>]*>', '', username)
+        
+        # Remove control characters and null bytes
+        username = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', username)
+        
+        # If empty after sanitization, use default
+        if not username:
+            return "Anonymous"
+        
+        return username
 
     async def create_session(self, quiz_id: str, host_id: str, mode: str = "live", 
                             per_question_time_limit: int = 30) -> str:
@@ -81,6 +103,9 @@ class SessionManager:
         session_key = f"session:{session_code}"
         lock_key = f"lock:session:{session_code}:participants"
         
+        # SECURITY: Validate and sanitize username
+        username = self._sanitize_username(username)
+        
         # Check if user is the host - hosts should NOT be in participant list
         host_id = await self.redis.hget(session_key, "host_id")
         if user_id == host_id:
@@ -118,6 +143,12 @@ class SessionManager:
                     
                     participants = json.loads(participants_json)
                     
+                    # LIMIT: Max 200 participants per session to prevent server overload
+                    MAX_PARTICIPANTS = 200
+                    if user_id not in participants and len(participants) >= MAX_PARTICIPANTS:
+                        logger.warning(f"Session {session_code} is full ({MAX_PARTICIPANTS} participants)")
+                        return False
+                    
                     # Add or update participant
                     if user_id in participants:
                         # Reconnecting user - preserve state
@@ -139,6 +170,11 @@ class SessionManager:
                     # Save updated participants
                     await self.redis.hset(session_key, "participants", json.dumps(participants))
                     logger.debug(f"Session {session_code} now has {len(participants)} participants")
+                    
+                    # Track this user's active session for reconnection
+                    active_session_key = f"user_active_session:{user_id}"
+                    await self.redis.set(active_session_key, session_code, ex=SESSION_EXPIRY_HOURS * 3600)
+                    
                     return True
                     
                 finally:
@@ -193,8 +229,24 @@ class SessionManager:
         return True
 
     async def end_session(self, session_code: str) -> bool:
-        """Mark session as completed"""
-        await self.redis.hset(f"session:{session_code}", "status", "completed")
+        """Mark session as completed and clean up active session tracking"""
+        session_key = f"session:{session_code}"
+        
+        # Get participants and host to clean up their active session tracking
+        session = await self.get_session(session_code)
+        if session:
+            # Clean up host's active session
+            host_id = session.get("host_id")
+            if host_id:
+                await self.redis.delete(f"user_active_session:{host_id}")
+            
+            # Clean up all participants' active sessions
+            participants = session.get("participants", {})
+            for user_id in participants.keys():
+                await self.redis.delete(f"user_active_session:{user_id}")
+        
+        await self.redis.hset(session_key, "status", "completed")
+        logger.info(f"Session {session_code} ended and active session tracking cleaned up")
         return True
 
     async def is_host(self, session_code: str, user_id: str) -> bool:

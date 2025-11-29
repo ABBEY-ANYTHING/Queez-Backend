@@ -5,6 +5,7 @@ from app.services.session_manager import SessionManager
 from app.services.game_controller import GameController
 from app.services.leaderboard_manager import LeaderboardManager
 from app.core.database import get_redis
+from app.core.config import SESSION_EXPIRY_HOURS
 import json
 import logging
 import asyncio
@@ -34,6 +35,21 @@ async def websocket_endpoint(websocket: WebSocket, session_code: str, user_id: s
     """
     WebSocket endpoint for real-time quiz sessions
     """
+    # SECURITY: Validate session code format (6 alphanumeric characters)
+    import re
+    if not session_code or not re.match(r'^[A-Z0-9]{6}$', session_code.upper()):
+        logger.warning(f"Invalid session code format: {session_code}")
+        await websocket.close(code=4001, reason="Invalid session code format")
+        return
+    
+    # SECURITY: Validate user_id format (prevent injection)
+    if not user_id or len(user_id) > 128 or not re.match(r'^[a-zA-Z0-9_-]+$', user_id):
+        logger.warning(f"Invalid user_id format: {user_id}")
+        await websocket.close(code=4002, reason="Invalid user ID format")
+        return
+    
+    session_code = session_code.upper()  # Normalize to uppercase
+    
     # === CRITICAL: Accept connection FIRST ===
     try:
         await websocket.accept()
@@ -53,6 +69,16 @@ async def websocket_endpoint(websocket: WebSocket, session_code: str, user_id: s
         # Listen for messages
         async for message_data in websocket.iter_text():
             try:
+                # SECURITY: Limit message size to prevent DoS
+                MAX_MESSAGE_SIZE = 10000  # 10KB max
+                if len(message_data) > MAX_MESSAGE_SIZE:
+                    logger.warning(f"Message too large from {user_id}: {len(message_data)} bytes")
+                    await manager.send_personal_message({
+                        "type": "error",
+                        "payload": {"message": "Message too large"}
+                    }, websocket)
+                    continue
+                
                 message = json.loads(message_data)
                 message_type = message.get("type")
                 payload = message.get("payload", {})
@@ -102,6 +128,18 @@ async def websocket_endpoint(websocket: WebSocket, session_code: str, user_id: s
         logger.error(f"WebSocket error for user={user_id}: {e}")
     finally:
         manager.disconnect(websocket, session_code, user_id)
+        
+        # Handle host disconnect - notify participants
+        if is_host:
+            session = await session_manager.get_session(session_code)
+            if session and session.get("status") == "active":
+                # Host left during active quiz - notify participants
+                await manager.broadcast_to_session({
+                    "type": "host_disconnected",
+                    "payload": {"message": "Host has disconnected. Quiz may be interrupted."}
+                }, session_code)
+                logger.warning(f"Host {user_id} disconnected during active session {session_code}")
+        
         logger.info(f"User {user_id} disconnected from session {session_code}")
 
 
@@ -115,6 +153,18 @@ async def handle_join(websocket: WebSocket, session_code: str, user_id: str, pay
         await manager.send_personal_message({"type": "error", "payload": {"message": "Session not found"}}, websocket)
         return
     
+    # Check if session has expired
+    expires_at = session.get("expires_at")
+    if expires_at:
+        try:
+            expiry_time = datetime.fromisoformat(expires_at)
+            if datetime.utcnow() > expiry_time:
+                logger.warning(f"Session {session_code} has expired")
+                await manager.send_personal_message({"type": "error", "payload": {"message": "Session has expired"}}, websocket)
+                return
+        except (ValueError, TypeError):
+            pass  # Invalid date format, skip check
+    
     # ✅ CHECK IF USER IS HOST FIRST
     is_host = await session_manager.is_host(session_code, user_id)
     
@@ -127,6 +177,21 @@ async def handle_join(websocket: WebSocket, session_code: str, user_id: str, pay
         participants_list = list(session.get("participants", {}).values())
         session_payload["participants"] = participants_list
         session_payload["participant_count"] = len(participants_list)
+        
+        # Track host's active session for reconnection
+        redis = await get_redis()
+        from app.core.config import SESSION_EXPIRY_HOURS
+        active_session_key = f"user_active_session:{user_id}"
+        await redis.set(active_session_key, session_code, ex=SESSION_EXPIRY_HOURS * 3600)
+        
+        # Check if host is reconnecting during active quiz
+        if session.get("status") == "active":
+            # Notify participants that host is back
+            await manager.broadcast_to_session({
+                "type": "host_reconnected",
+                "payload": {"message": "Host has reconnected"}
+            }, session_code)
+            logger.info(f"Host {user_id} reconnected to active session {session_code}")
         
         # Send session state to host
         await manager.send_personal_message({
@@ -173,14 +238,50 @@ async def handle_join(websocket: WebSocket, session_code: str, user_id: str, pay
             "payload": session_payload
         }, websocket)
         
-        # If reconnecting during active quiz, send current question
-        if is_reconnecting and session["status"] == "active":
-            question_data = await game_controller.get_current_question(session_code)
-            if question_data:
+        # Handle different session states for reconnecting/joining users
+        if session["status"] == "completed":
+            # Quiz already finished - send final results
+            final_results = await leaderboard_manager.get_final_results(session_code)
+            await manager.send_personal_message({
+                "type": "quiz_completed",
+                "payload": {
+                    "message": "This quiz has already ended.",
+                    "results": final_results
+                }
+            }, websocket)
+        elif session["status"] == "active":
+            # Quiz in progress - send THIS user's current question (not the broadcast one)
+            user_question_index = await game_controller.get_participant_question_index(session_code, user_id)
+            total_questions = await game_controller.get_total_questions(session_code)
+            
+            # EDGE CASE: If user rejoins and their index was never set, initialize to 0
+            redis = await get_redis()
+            index_key = f"participant:{session_code}:{user_id}:question_index"
+            stored_index = await redis.get(index_key)
+            if stored_index is None and not is_reconnecting:
+                # New joiner during active quiz - they start from question 0
+                await game_controller.set_participant_question_index(session_code, user_id, 0)
+                user_question_index = 0
+                logger.info(f"Initialized question index for late joiner {user_id}")
+            
+            if user_question_index >= total_questions:
+                # User already completed - send their results
+                final_results = await leaderboard_manager.get_final_results(session_code)
                 await manager.send_personal_message({
-                    "type": "question",
-                    "payload": question_data
+                    "type": "quiz_completed",
+                    "payload": {
+                        "message": "You've completed all questions!",
+                        "results": final_results
+                    }
                 }, websocket)
+            else:
+                # Send the question at THEIR current index
+                question_data = await game_controller.get_question_by_index(session_code, user_question_index)
+                if question_data:
+                    await manager.send_personal_message({
+                        "type": "question",
+                        "payload": question_data
+                    }, websocket)
     else:
         logger.error(f"Failed to add {username} to session {session_code}")
 
@@ -247,6 +348,47 @@ async def handle_start_quiz(websocket: WebSocket, session_code: str, user_id: st
         await manager.send_personal_message({
             "type": "error",
             "payload": {"message": "Only host can start the quiz"}
+        }, websocket)
+        return
+    
+    # Check if quiz has questions
+    total_questions = await game_controller.get_total_questions(session_code)
+    if total_questions == 0:
+        await manager.send_personal_message({
+            "type": "error",
+            "payload": {"message": "Cannot start quiz: No questions found"}
+        }, websocket)
+        return
+    
+    # Check if there are any participants
+    session = await session_manager.get_session(session_code)
+    if not session:
+        await manager.send_personal_message({
+            "type": "error",
+            "payload": {"message": "Session not found"}
+        }, websocket)
+        return
+    
+    participants = session.get("participants", {})
+    if len(participants) == 0:
+        await manager.send_personal_message({
+            "type": "error",
+            "payload": {"message": "Cannot start quiz: No participants have joined"}
+        }, websocket)
+        return
+    
+    # Extract time settings from payload
+    if session.get("status") == "active":
+        await manager.send_personal_message({
+            "type": "error",
+            "payload": {"message": "Quiz has already started"}
+        }, websocket)
+        return
+    
+    if session.get("status") == "completed":
+        await manager.send_personal_message({
+            "type": "error",
+            "payload": {"message": "Quiz has already ended"}
         }, websocket)
         return
     
@@ -325,6 +467,18 @@ async def handle_submit_answer(websocket: WebSocket, session_code: str, user_id:
                 "payload": {"message": "Host cannot participate in quiz"}
             }, websocket)
             return
+        
+        # RATE LIMIT: Prevent answer spam (max 1 answer per 0.5 seconds per user)
+        redis = await get_redis()
+        rate_key = f"rate:answer:{session_code}:{user_id}"
+        last_submit = await redis.get(rate_key)
+        if last_submit:
+            await manager.send_personal_message({
+                "type": "error",
+                "payload": {"message": "Please wait before submitting again"}
+            }, websocket)
+            return
+        await redis.set(rate_key, "1", ex=1)  # 1 second cooldown
         
         answer = payload.get("answer")
         timestamp = payload.get("timestamp", datetime.utcnow().timestamp())
@@ -430,6 +584,27 @@ async def handle_request_next_question(websocket: WebSocket, session_code: str, 
         is_host = await session_manager.is_host(session_code, user_id)
         if is_host:
             return  # Silently ignore host requests for questions
+        
+        # Check if session is still active
+        session = await session_manager.get_session(session_code)
+        if not session:
+            await manager.send_personal_message({
+                "type": "error",
+                "payload": {"message": "Session not found"}
+            }, websocket)
+            return
+        
+        if session.get("status") == "completed":
+            # Quiz already ended - send final results
+            final_results = await leaderboard_manager.get_final_results(session_code)
+            await manager.send_personal_message({
+                "type": "quiz_completed",
+                "payload": {
+                    "message": "This quiz has already ended.",
+                    "results": final_results
+                }
+            }, websocket)
+            return
         
         # Get participant's current index (already advanced after answering)
         current_index = await game_controller.get_participant_question_index(session_code, user_id)

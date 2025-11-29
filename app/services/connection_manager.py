@@ -18,10 +18,31 @@ class ConnectionManager:
         self._lock = asyncio.Lock()
         # Track dead connections to clean up
         self._dead_connections: Set[str] = set()
+        # Track connection attempts for rate limiting
+        self._connection_times: Dict[str, float] = {}
+        # Minimum time between connections from same user (seconds)
+        self._MIN_RECONNECT_INTERVAL = 1.0
 
     async def connect(self, websocket: WebSocket, session_code: str, user_id: str, is_host: bool = False):
         """Register a new WebSocket connection"""
+        import time
+        
         async with self._lock:
+            # Rate limit connections to prevent reconnection spam
+            current_time = time.time()
+            last_connect = self._connection_times.get(user_id, 0)
+            if current_time - last_connect < self._MIN_RECONNECT_INTERVAL:
+                logger.warning(f"Connection rate limit: {user_id} reconnecting too fast")
+                # Don't reject, but log for monitoring
+            self._connection_times[user_id] = current_time
+            
+            # Clean up old connection times (prevent memory leak)
+            if len(self._connection_times) > 1000:
+                cutoff = current_time - 60  # Remove entries older than 1 minute
+                self._connection_times = {
+                    k: v for k, v in self._connection_times.items() if v > cutoff
+                }
+            
             if session_code not in self.session_connections:
                 self.session_connections[session_code] = {}
             
