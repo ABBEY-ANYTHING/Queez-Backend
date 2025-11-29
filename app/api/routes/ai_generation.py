@@ -390,7 +390,7 @@ IMPORTANT: Return ONLY valid JSON without any markdown formatting or code blocks
             "category": study_set_metadata.get("category", "Other"),
             "language": study_set_metadata.get("language", "English"),
             "coverImagePath": None,
-            "creatorId": user_id,
+            "ownerId": user_id,
             "quizzes": quizzes,
             "flashcardSets": flashcard_sets,
             "notes": notes,
