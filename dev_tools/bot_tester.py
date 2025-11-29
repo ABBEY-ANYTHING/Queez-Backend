@@ -243,22 +243,40 @@ async def run_bots(session_code: str, num_bots: int, batch_size: int = 10, batch
     # Main quiz loop - all bots answer together
     max_rounds = 50  # Safety limit
     round_count = 0
+    no_progress_count = 0
     
     while round_count < max_rounds:
         round_count += 1
         
         # Check if all bots completed or disconnected
         active_connected = [b for b in connected_bots if b.is_connected and not b.quiz_completed]
+        completed_bots = [b for b in connected_bots if b.quiz_completed]
+        
+        print(f"📊 Status: {len(completed_bots)} completed, {len(active_connected)} active")
+        
         if not active_connected:
             print("✅ All bots completed or disconnected")
             break
         
         # Get bots that have a question and are ready to answer
-        ready_bots = [b for b in active_connected if b.current_question]
+        ready_bots = [b for b in active_connected if b.current_question and not b.waiting_for_result]
         
         if not ready_bots:
+            no_progress_count += 1
+            if no_progress_count > 10:
+                print("⚠️ No progress for 10 rounds, checking completion...")
+                # Force mark remaining bots as completed if they answered all questions
+                for bot in active_connected:
+                    if bot.current_question:
+                        total = bot.current_question.get("total", 1)
+                        if bot.questions_answered >= total:
+                            bot.quiz_completed = True
+                            print(f"   ✅ {bot.username} marked complete ({bot.questions_answered}/{total})")
+                no_progress_count = 0
             await asyncio.sleep(0.5)
             continue
+        
+        no_progress_count = 0
         
         # All ready bots submit answers together
         print(f"📤 {len(ready_bots)} bots answering...")
@@ -272,6 +290,11 @@ async def run_bots(session_code: str, num_bots: int, batch_size: int = 10, batch
                 break
             await asyncio.sleep(0.3)
             timeout -= 0.3
+        
+        if timeout <= 0:
+            print("⚠️ Timeout waiting for results, continuing...")
+            for bot in ready_bots:
+                bot.waiting_for_result = False
         
         # Delay between questions
         await asyncio.sleep(QUESTION_DELAY)
