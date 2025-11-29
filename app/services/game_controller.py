@@ -150,30 +150,46 @@ class GameController:
     async def _process_answer_internal(self, session_code: str, user_id: str, answer: Any, timestamp: float) -> Dict[str, Any]:
         """Internal answer processing (called with lock held)"""
         session_key = f"session:{session_code}"
+        cache_key = f"quiz_cache:{session_code}"
         
         # Get participant's current question index
         current_index = await self.get_participant_question_index(session_code, user_id)
         
         logger.debug(f"📝 Processing answer for user {user_id} on question {current_index}")
         
-        # Get session state
-        session_data = await self.redis.hmget(session_key, ["quiz_id", "participants"])
-        quiz_id = session_data[0]
-        participants_json = session_data[1]
+        # Get session state (participants)
+        participants_json = await self.redis.hget(session_key, "participants")
         
-        if not quiz_id:
+        if not participants_json:
             return {"error": "Session not found"}
 
-        # Get correct answer
-        quiz = await quiz_collection.find_one({"_id": ObjectId(quiz_id)})
+        # Try to get quiz from cache first
+        cached_quiz = await self.redis.get(cache_key)
         
-        if not quiz or "questions" not in quiz:
-            return {"error": "Quiz not found"}
+        if cached_quiz:
+            quiz_data = json.loads(cached_quiz)
+            questions = quiz_data.get("questions", [])
+        else:
+            # Fallback to MongoDB and cache
+            quiz_id = await self.redis.hget(session_key, "quiz_id")
+            if not quiz_id:
+                return {"error": "Quiz ID not found"}
+            
+            quiz = await quiz_collection.find_one({"_id": ObjectId(quiz_id)})
+            
+            if not quiz or "questions" not in quiz:
+                return {"error": "Quiz not found"}
+            
+            questions = quiz["questions"]
+            
+            # Cache for next time
+            quiz_to_cache = {"questions": questions, "quiz_id": quiz_id}
+            await self.redis.setex(cache_key, 3600, json.dumps(quiz_to_cache))
         
-        if current_index >= len(quiz["questions"]):
+        if current_index >= len(questions):
             return {"error": "Invalid question index"}
         
-        question = quiz["questions"][current_index]
+        question = questions[current_index]
         question_type = question.get("type", "singleMcq")
         
         # Handle different question types
@@ -320,13 +336,18 @@ class GameController:
                 "correct_answer": correct_answer_response,
                 "user_answer": stored_answer,
                 "new_total_score": participant["score"],
-                "question_type": question_type
+                "question_type": question_type,
+                "question_index": current_index
             }
             
             # Add partial credit info for multi-choice
             if question_type == "multiMcq":
                 response["partial_credit"] = round(partial_credit_percentage, 1)
                 response["is_partial"] = partial_credit_percentage > 0 and partial_credit_percentage < 100
+            
+            # ✅ ADVANCE participant's question index immediately after answering
+            # This way request_next_question just needs to get the next question
+            await self.set_participant_question_index(session_code, user_id, current_index + 1)
             
             return response
             
@@ -412,28 +433,18 @@ class GameController:
         return (correct_count / len(answers)) * 100
 
     async def get_participant_question_index(self, session_code: str, user_id: str) -> int:
-        """Get the current question index for a specific participant"""
-        session_key = f"session:{session_code}"
+        """Get the current question index for a specific participant (Redis is the source of truth)"""
         participant_key = f"participant:{session_code}:{user_id}:question_index"
         
-        # Try to get from Redis first
+        # Get from Redis - this is the single source of truth
         index = await self.redis.get(participant_key)
         
         if index is not None:
             return int(index)
         
-        # If not found, check their answers to determine progress
-        participants_json = await self.redis.hget(session_key, "participants")
-        if participants_json:
-            participants = json.loads(participants_json)
-            if user_id in participants:
-                answers = participants[user_id].get("answers", [])
-                # Return the highest question index they've answered
-                if answers:
-                    max_index = max(ans["question_index"] for ans in answers)
-                    return max_index
-        
-        return 0  # Default to first question
+        # Not initialized yet - default to 0
+        # This should only happen if they joined before quiz started
+        return 0
 
     async def set_participant_question_index(self, session_code: str, user_id: str, index: int):
         """Set the current question index for a specific participant"""
@@ -442,7 +453,16 @@ class GameController:
         logger.debug(f"✅ PROGRESS - Set {user_id} question index to {index}")
 
     async def get_total_questions(self, session_code: str) -> int:
-        """Get total number of questions in the quiz"""
+        """Get total number of questions in the quiz (uses cached data)"""
+        # Try to get from cache first
+        cache_key = f"quiz_cache:{session_code}"
+        cached_quiz = await self.redis.get(cache_key)
+        
+        if cached_quiz:
+            quiz_data = json.loads(cached_quiz)
+            return len(quiz_data.get("questions", []))
+        
+        # Fallback to MongoDB and cache it
         session_key = f"session:{session_code}"
         quiz_id = await self.redis.hget(session_key, "quiz_id")
         
@@ -453,34 +473,57 @@ class GameController:
         if not quiz or "questions" not in quiz:
             return 0
         
+        # Cache the quiz for 1 hour
+        quiz_to_cache = {
+            "questions": quiz["questions"],
+            "quiz_id": quiz_id
+        }
+        await self.redis.setex(cache_key, 3600, json.dumps(quiz_to_cache))
+        
         return len(quiz["questions"])
 
     async def get_question_by_index(self, session_code: str, index: int) -> Optional[Dict[str, Any]]:
-        """Get a specific question by index"""
+        """Get a specific question by index (uses cached data for speed)"""
         session_key = f"session:{session_code}"
+        cache_key = f"quiz_cache:{session_code}"
         
-        logger.info(f"📚 Getting question {index} for session {session_code}")
+        logger.debug(f"📚 Getting question {index} for session {session_code}")
         
-        # Get quiz ID and session time settings
-        session_data = await self.redis.hmget(session_key, ["quiz_id", "per_question_time_limit"])
-        quiz_id = session_data[0]
-        session_per_question_limit = int(session_data[1]) if session_data[1] else QUESTION_TIME_SECONDS
+        # Get session time settings
+        session_per_question_limit_raw = await self.redis.hget(session_key, "per_question_time_limit")
+        session_per_question_limit = int(session_per_question_limit_raw) if session_per_question_limit_raw else QUESTION_TIME_SECONDS
         
-        if not quiz_id:
-            logger.error(f"❌ Quiz ID not found for session {session_code}")
-            return None
+        # Try to get quiz from cache first
+        cached_quiz = await self.redis.get(cache_key)
         
-        # Fetch quiz from MongoDB
-        quiz = await quiz_collection.find_one({"_id": ObjectId(quiz_id)})
-        
-        if not quiz or "questions" not in quiz:
-            logger.error(f"❌ Quiz or questions not found")
-            return None
-        
-        questions = quiz["questions"]
+        if cached_quiz:
+            quiz_data = json.loads(cached_quiz)
+            questions = quiz_data.get("questions", [])
+        else:
+            # Fetch from MongoDB and cache
+            quiz_id = await self.redis.hget(session_key, "quiz_id")
+            
+            if not quiz_id:
+                logger.error(f"❌ Quiz ID not found for session {session_code}")
+                return None
+            
+            quiz = await quiz_collection.find_one({"_id": ObjectId(quiz_id)})
+            
+            if not quiz or "questions" not in quiz:
+                logger.error(f"❌ Quiz or questions not found")
+                return None
+            
+            questions = quiz["questions"]
+            
+            # Cache the quiz for 1 hour
+            quiz_to_cache = {
+                "questions": questions,
+                "quiz_id": quiz_id
+            }
+            await self.redis.setex(cache_key, 3600, json.dumps(quiz_to_cache))
         
         if index >= len(questions):
-            logger.warning(f"⚠️ Question index {index} out of range (total: {len(questions)})")
+            logger.debug(f"⚠️ Question index {index} out of range (total: {len(questions)})")
             return None
         
         question = questions[index]
@@ -493,7 +536,7 @@ class GameController:
             logger.error(f"❌ Question {index} has empty question text!")
             return None
         
-        logger.info(f"✅ Retrieved question {index + 1}/{len(questions)}: {question_text[:50]}...")
+        logger.debug(f"✅ Retrieved question {index + 1}/{len(questions)}: {question_text[:50]}...")
         
         # Use session's per-question time limit (set by host)
         question_time_limit = session_per_question_limit

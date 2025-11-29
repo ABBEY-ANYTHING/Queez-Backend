@@ -446,12 +446,16 @@ async def handle_next_question(websocket: WebSocket, session_code: str, user_id:
 
 
 async def handle_request_next_question(websocket: WebSocket, session_code: str, user_id: str):
-    """Participant requests their next question (self-paced)"""
+    """Participant requests their next question (self-paced)
+    
+    NOTE: The participant's question index is already advanced after they answer.
+    So we just need to fetch the question at their current index.
+    """
     try:
         logger.debug(f"📨 SELF_PACED - Participant {user_id} requesting next question")
         
-        # Get participant's current progress
-        participant_question_index = await game_controller.get_participant_question_index(session_code, user_id)
+        # Get participant's current index (already advanced after answering)
+        current_index = await game_controller.get_participant_question_index(session_code, user_id)
         total_questions = await game_controller.get_total_questions(session_code)
         
         if total_questions == 0:
@@ -462,11 +466,10 @@ async def handle_request_next_question(websocket: WebSocket, session_code: str, 
             }, websocket)
             return
         
-        logger.debug(f"📊 SELF_PACED - Current index for {user_id}: {participant_question_index}/{total_questions}")
+        logger.debug(f"📊 SELF_PACED - Current index for {user_id}: {current_index}/{total_questions}")
         
-        # Check if participant has already completed all questions
-        # They completed if their index is at or past the last question (total - 1)
-        if participant_question_index >= total_questions - 1:
+        # Check if participant has completed all questions
+        if current_index >= total_questions:
             logger.info(f"🏁 SELF_PACED - Participant {user_id} has completed all questions!")
             
             # Get final results
@@ -481,26 +484,20 @@ async def handle_request_next_question(websocket: WebSocket, session_code: str, 
                 }
             }, websocket)
             
-            # Check if ALL participants have completed (debounced)
+            # Check if ALL participants have completed
             await check_all_participants_completed(session_code, total_questions)
             return
         
-        # Increment their question index
-        next_index = participant_question_index + 1
-        await game_controller.set_participant_question_index(session_code, user_id, next_index)
-        
-        logger.debug(f"➡️ SELF_PACED - Participant {user_id} advancing: Q{participant_question_index} → Q{next_index}")
-        
-        # Get the next question for this participant
-        question_data = await game_controller.get_question_by_index(session_code, next_index)
+        # Get the question at current index
+        question_data = await game_controller.get_question_by_index(session_code, current_index)
         
         if question_data:
-            # Send next question to this participant only
+            # Send question to this participant only
             await manager.send_personal_message({
                 "type": "question",
                 "payload": question_data
             }, websocket)
-            logger.debug(f"✅ SELF_PACED - Sent Q{next_index + 1}/{total_questions} to {user_id}")
+            logger.debug(f"✅ SELF_PACED - Sent Q{current_index + 1}/{total_questions} to {user_id}")
         else:
             # No more questions - participant finished
             logger.info(f"🏁 SELF_PACED - Participant {user_id} completed all questions!")
@@ -552,8 +549,9 @@ async def check_all_participants_completed(session_code: str, total_questions: i
         
         for participant_id in participants.keys():
             participant_index = await game_controller.get_participant_question_index(session_code, participant_id)
-            # Participant has completed if they're on the last question or beyond
-            if participant_index >= total_questions - 1:
+            # Participant has completed if their index >= total_questions
+            # (index is advanced to total_questions after answering the last question)
+            if participant_index >= total_questions:
                 completed_count += 1
             else:
                 all_completed = False
@@ -623,12 +621,12 @@ async def handle_request_leaderboard(websocket: WebSocket, session_code: str, us
             return
         
         participants = session.get("participants", {})
-        total_questions = session.get("total_questions", 0)
+        total_questions = await game_controller.get_total_questions(session_code)
         
         # Build leaderboard with question progress
         leaderboard_entries = []
         for participant_id, participant_data in participants.items():
-            # Get participant's current question index
+            # Get participant's current question index (already advanced after answering)
             question_index = await game_controller.get_participant_question_index(session_code, participant_id)
             
             # Count answered questions from their answers array
@@ -639,8 +637,8 @@ async def handle_request_leaderboard(websocket: WebSocket, session_code: str, us
                 "user_id": participant_id,
                 "username": participant_data.get("username", "Unknown"),
                 "score": participant_data.get("score", 0),
-                "question_index": question_index,
-                "answered_count": answered_count,
+                "question_index": question_index,  # This is the NEXT question they'll see
+                "answered_count": answered_count,  # How many they've answered
                 "total_questions": total_questions,
                 "connected": participant_data.get("connected", False)
             })
