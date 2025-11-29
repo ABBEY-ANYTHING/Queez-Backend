@@ -1,5 +1,9 @@
+import os
+import json
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import firebase_admin
+from firebase_admin import credentials
 
 from app.core.config import (
     APP_TITLE,
@@ -10,6 +14,20 @@ from app.core.config import (
     CORS_METHODS,
     CORS_HEADERS
 )
+
+# Initialize Firebase Admin SDK
+firebase_credentials = os.getenv("FIREBASE_CREDENTIALS")
+if firebase_credentials:
+    try:
+        cred_dict = json.loads(firebase_credentials)
+        cred = credentials.Certificate(cred_dict)
+        firebase_admin.initialize_app(cred)
+        print("Firebase Admin SDK initialized successfully")
+    except Exception as e:
+        print(f"Warning: Failed to initialize Firebase Admin SDK: {e}")
+else:
+    print("Warning: FIREBASE_CREDENTIALS environment variable not set")
+
 from app.api.routes import (
     quizzes,
     flashcards,
