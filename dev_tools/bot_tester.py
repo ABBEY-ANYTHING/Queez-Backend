@@ -49,6 +49,7 @@ class QuizBot:
         self.current_question = None
         self.waiting_for_result = False
         self.total_questions = 0
+        self.last_answered_index = -1
         self._receive_lock = asyncio.Lock()
         
     def _log(self, message: str):
@@ -147,6 +148,11 @@ class QuizBot:
         await self._send_message("submit_answer", {"answer": answer, "timestamp": think_time})
         self.questions_answered += 1
         self.waiting_for_result = True
+        
+        # Clear current question after answering - will be set when we get the next one
+        self.last_answered_index = index
+        self.current_question = None
+        
         self._log(f"📤 Answered Q{index + 1}/{total}")
     
     async def request_next(self):
@@ -292,7 +298,6 @@ async def run_bots(session_code: str, num_bots: int, batch_size: int = 10, batch
     max_rounds = 100  # Safety limit
     round_count = 0
     no_progress_count = 0
-    last_question_count = 0
     
     while round_count < max_rounds:
         round_count += 1
@@ -313,10 +318,14 @@ async def run_bots(session_code: str, num_bots: int, batch_size: int = 10, batch
         # Get bots that have a question and are ready to answer
         ready_bots = [b for b in active_connected if b.current_question and not b.waiting_for_result]
         
-        if not ready_bots:
+        # Get bots waiting for next question (answered but no new question yet)
+        waiting_for_question = [b for b in active_connected if not b.current_question and not b.waiting_for_result]
+        
+        if not ready_bots and not waiting_for_question:
+            # All bots are waiting for answer results
             no_progress_count += 1
-            if no_progress_count > 30:  # 15 seconds with no progress
-                print("⚠️ No progress for 15 seconds...")
+            if no_progress_count > 60:  # 30 seconds with no progress
+                print("⚠️ No progress for 30 seconds, checking status...")
                 
                 # Check if bots answered all questions
                 for bot in active_connected:
@@ -330,41 +339,42 @@ async def run_bots(session_code: str, num_bots: int, batch_size: int = 10, batch
         
         no_progress_count = 0
         
-        # All ready bots submit answers together (in batches to prevent overwhelming)
-        for i in range(0, len(ready_bots), batch_size):
-            batch = ready_bots[i:i + batch_size]
-            await asyncio.gather(*[b.submit_answer() for b in batch], return_exceptions=True)
-            if i + batch_size < len(ready_bots):
-                await asyncio.sleep(0.2)
-        
-        # Wait for results (with timeout)
-        timeout = 20
-        while timeout > 0:
-            waiting = [b for b in ready_bots if b.waiting_for_result and b.is_connected]
-            if not waiting:
-                break
-            await asyncio.sleep(0.3)
-            timeout -= 0.3
-        
-        if timeout <= 0:
-            print(f"⚠️ Timeout waiting for {len([b for b in ready_bots if b.waiting_for_result])} results, continuing...")
-            for bot in ready_bots:
-                bot.waiting_for_result = False
-        
-        # Delay between questions
-        await asyncio.sleep(QUESTION_DELAY)
-        
-        # All non-completed bots request next question together (in batches)
-        non_completed = [b for b in connected_bots if b.is_connected and not b.quiz_completed]
-        if non_completed:
-            for i in range(0, len(non_completed), batch_size):
-                batch = non_completed[i:i + batch_size]
+        # Bots waiting for question should request next question
+        if waiting_for_question:
+            for i in range(0, len(waiting_for_question), batch_size):
+                batch = waiting_for_question[i:i + batch_size]
                 await asyncio.gather(*[b.request_next() for b in batch], return_exceptions=True)
-                if i + batch_size < len(non_completed):
+                if i + batch_size < len(waiting_for_question):
                     await asyncio.sleep(0.1)
+            
+            # Wait for questions to arrive
+            await asyncio.sleep(1.0)
+            continue
         
-        # Wait for questions to arrive
-        await asyncio.sleep(1.5)
+        # All ready bots submit answers together (in batches to prevent overwhelming)
+        if ready_bots:
+            for i in range(0, len(ready_bots), batch_size):
+                batch = ready_bots[i:i + batch_size]
+                await asyncio.gather(*[b.submit_answer() for b in batch], return_exceptions=True)
+                if i + batch_size < len(ready_bots):
+                    await asyncio.sleep(0.2)
+            
+            # Wait for results (with timeout)
+            timeout = 20
+            while timeout > 0:
+                waiting = [b for b in ready_bots if b.waiting_for_result and b.is_connected]
+                if not waiting:
+                    break
+                await asyncio.sleep(0.3)
+                timeout -= 0.3
+            
+            if timeout <= 0:
+                print(f"⚠️ Timeout waiting for {len([b for b in ready_bots if b.waiting_for_result])} results, continuing...")
+                for bot in ready_bots:
+                    bot.waiting_for_result = False
+            
+            # Delay between questions
+            await asyncio.sleep(QUESTION_DELAY)
     
     # All done - wait a bit for final messages
     print("\n" + "="*60)
