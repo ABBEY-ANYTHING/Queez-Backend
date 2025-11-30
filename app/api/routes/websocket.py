@@ -198,6 +198,20 @@ async def handle_join(websocket: WebSocket, session_code: str, user_id: str, pay
             "type": "session_state",
             "payload": session_payload
         }, websocket)
+        
+        # ✅ FIX: If quiz is active, also send leaderboard immediately
+        # This ensures host sees scores right after reconnection
+        if session.get("status") == "active":
+            leaderboard = await leaderboard_manager.get_leaderboard(session_code)
+            await manager.send_personal_message({
+                "type": "leaderboard_response",
+                "payload": {
+                    "leaderboard": leaderboard,
+                    "total_questions": await game_controller.get_total_questions(session_code)
+                }
+            }, websocket)
+            logger.info(f"Sent initial leaderboard to reconnecting host {user_id}")
+        
         return  # Done - host doesn't get added to participants
     
     # ✅ REGULAR PARTICIPANT LOGIC BELOW
