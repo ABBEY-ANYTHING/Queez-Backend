@@ -807,12 +807,13 @@ async def handle_end_quiz(websocket: WebSocket, session_code: str, user_id: str)
     # Get final results
     final_results = await leaderboard_manager.get_final_results(session_code)
     
-    # Broadcast quiz end
+    # Broadcast quiz end with host_ended flag so participants know host manually ended it
     await manager.broadcast_to_session({
         "type": "quiz_ended",
         "payload": {
-            "message": "Quiz completed!",
-            "results": final_results
+            "message": "Host ended the quiz",
+            "results": final_results,
+            "host_ended": True
         }
     }, session_code)
 
