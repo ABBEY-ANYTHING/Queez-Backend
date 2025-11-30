@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 import json
@@ -17,14 +18,11 @@ class GameController:
         """Get the current question for the session"""
         session_key = f"session:{session_code}"
         
-        logger.info(f"📚 Getting current question for session {session_code}")
-        
         # Get current index and quiz ID
         session_data = await self.redis.hmget(session_key, ["current_question_index", "quiz_id", "question_start_time"])
-        logger.info(f"📊 Session data from Redis: index={session_data[0]}, quiz_id={session_data[1]}")
         
         if not all(session_data[:2]): # Check if index and quiz_id exist
-            logger.error(f"❌ Missing session data! index={session_data[0]}, quiz_id={session_data[1]}")
+            logger.error(f"Missing session data for {session_code}")
             return None
             
         current_index = int(session_data[0])
@@ -32,22 +30,18 @@ class GameController:
         start_time = session_data[2]
         
         # Fetch quiz from MongoDB (could be cached in Redis for performance)
-        logger.info(f"🔍 Fetching quiz from MongoDB with ID: {quiz_id}")
         quiz = await quiz_collection.find_one({"_id": ObjectId(quiz_id)})
         
         if not quiz:
-            logger.error(f"❌ Quiz not found in MongoDB with ID: {quiz_id}")
+            logger.error(f"Quiz not found: {quiz_id}")
             return None
             
         if "questions" not in quiz:
-            logger.error(f"❌ Quiz {quiz_id} has no questions field!")
+            logger.error(f"Quiz {quiz_id} has no questions!")
             return None
-            
-        logger.info(f"✅ Quiz loaded successfully. Total questions: {len(quiz['questions'])}")
             
         questions = quiz["questions"]
         if current_index >= len(questions):
-            logger.warning(f"⚠️ Question index {current_index} out of range (total: {len(questions)})")
             return None
             
         question = questions[current_index]
@@ -58,10 +52,8 @@ class GameController:
         
         # Validate question text is not empty
         if not question_text or not question_text.strip():
-            logger.error(f"❌ Question {current_index} has empty question text!")
+            logger.error(f"Question {current_index} has empty text!")
             return None
-        
-        logger.info(f"✅ Retrieved question {current_index + 1}/{len(questions)}: {question_text[:50]}...")
         
         # Get per-question time limit (default to global config if not set)
         question_time_limit = question.get('timeLimit', QUESTION_TIME_SECONDS)
@@ -105,58 +97,132 @@ class GameController:
         }
 
     async def submit_answer(self, session_code: str, user_id: str, answer: Any, timestamp: float) -> Dict[str, Any]:
-        """Process a participant's answer"""
+        """Process a participant's answer with distributed locking to prevent race conditions"""
         session_key = f"session:{session_code}"
+        answer_lock_key = f"lock:answer:{session_code}:{user_id}"
+        
+        # Acquire distributed lock for this specific user's answer submission
+        max_retries = 20
+        lock_timeout = 5
+        
+        for attempt in range(max_retries):
+            try:
+                # Try to acquire lock
+                lock_acquired = await self.redis.set(
+                    answer_lock_key,
+                    "1",
+                    nx=True,
+                    ex=lock_timeout
+                )
+                
+                if not lock_acquired:
+                    # Lock held by another process, wait and retry
+                    await asyncio.sleep(0.05 * (attempt + 1))
+                    continue
+                
+                try:
+                    return await self._process_answer_internal(session_code, user_id, answer, timestamp)
+                finally:
+                    # Always release the lock
+                    await self.redis.delete(answer_lock_key)
+                    
+            except Exception as e:
+                logger.error(f"Answer submission error for {user_id} (attempt {attempt + 1}): {e}")
+                try:
+                    await self.redis.delete(answer_lock_key)
+                except:
+                    pass
+                if attempt == max_retries - 1:
+                    return {"error": "Failed to process answer, please try again"}
+                await asyncio.sleep(0.05)
+        
+        return {"error": "Failed to process answer after multiple attempts"}
+
+    async def _process_answer_internal(self, session_code: str, user_id: str, answer: Any, timestamp: float) -> Dict[str, Any]:
+        """Internal answer processing (called with per-user lock held)
+        
+        CRITICAL: We need a session-wide lock for participants updates to prevent
+        race conditions where concurrent answers overwrite each other.
+        """
+        session_key = f"session:{session_code}"
+        cache_key = f"quiz_cache:{session_code}"
+        participants_lock_key = f"lock:participants:{session_code}"
+        
+        # Check if session is still active (not completed)
+        session_status = await self.redis.hget(session_key, "status")
+        if session_status == "completed":
+            return {"error": "Quiz has already ended"}
         
         # Get participant's current question index
         current_index = await self.get_participant_question_index(session_code, user_id)
         
-        logger.info(f"📝 Processing answer for user {user_id} on question {current_index}")
+        # Check if user already completed all questions
+        total_questions = await self.get_total_questions(session_code)
+        if total_questions > 0 and current_index >= total_questions:
+            return {"error": "You have already completed all questions"}
         
-        # Get session state
-        session_data = await self.redis.hmget(session_key, ["quiz_id", "participants"])
-        quiz_id = session_data[0]
-        participants_json = session_data[1]
-        
-        if not quiz_id:
-            return {"error": "Session not found"}
+        logger.debug(f"Processing answer for {user_id} on Q{current_index + 1}")
 
-        # Get correct answer
-        quiz = await quiz_collection.find_one({"_id": ObjectId(quiz_id)})
+        # Try to get quiz from cache first
+        cached_quiz = await self.redis.get(cache_key)
         
-        if not quiz or "questions" not in quiz:
-            return {"error": "Quiz not found"}
+        if cached_quiz:
+            quiz_data = json.loads(cached_quiz)
+            questions = quiz_data.get("questions", [])
+        else:
+            # Fallback to MongoDB and cache
+            quiz_id = await self.redis.hget(session_key, "quiz_id")
+            if not quiz_id:
+                return {"error": "Quiz ID not found"}
+            
+            quiz = await quiz_collection.find_one({"_id": ObjectId(quiz_id)})
+            
+            if not quiz or "questions" not in quiz:
+                return {"error": "Quiz not found"}
+            
+            questions = quiz["questions"]
+            
+            # Cache for next time
+            quiz_to_cache = {"questions": questions, "quiz_id": quiz_id}
+            await self.redis.setex(cache_key, 3600, json.dumps(quiz_to_cache))
         
-        if current_index >= len(quiz["questions"]):
+        if current_index >= len(questions):
             return {"error": "Invalid question index"}
         
-        question = quiz["questions"][current_index]
+        question = questions[current_index]
         question_type = question.get("type", "singleMcq")
-        
-        logger.info(f"📝 Question type: {question_type}")
         
         # Handle different question types
         is_correct = False
         
         # Handle timeout (null answer)
         if answer is None:
-            logger.info(f"⏰ Timeout - user {user_id} did not answer in time")
             is_correct = False
         elif question_type in ["singleMcq", "trueFalse"]:
             # Single answer questions
             correct_answer = question.get("correctAnswerIndex")
             if correct_answer is None:
-                logger.error(f"❌ No correct answer found for question {current_index}")
+                logger.error(f"No correct answer for Q{current_index}")
                 return {"error": "Invalid question configuration"}
             
+            # VALIDATION: Check answer is a valid option index
+            options = question.get("options", [])
+            try:
+                answer_int = int(answer)
+                if answer_int < 0 or answer_int >= len(options):
+                    logger.warning(f"Invalid answer index {answer} from {user_id} (options: {len(options)})")
+                    return {"error": "Invalid answer option"}
+            except (ValueError, TypeError):
+                logger.warning(f"Non-integer answer from {user_id}: {answer}")
+                return {"error": "Invalid answer format"}
+            
             is_correct = int(answer) == int(correct_answer)
-            logger.info(f"🎯 Single answer check: user={user_id}, answer={answer}, correct={correct_answer}, is_correct={is_correct}")
             
         elif question_type == "multiMcq":
             # Multiple answer questions with partial credit
             correct_answers = question.get("correctAnswerIndices", [])
             if not correct_answers:
-                logger.error(f"❌ No correct answers found for multi-choice question {current_index}")
+                logger.error(f"No correct answers for multi-choice Q{current_index}")
                 return {"error": "Invalid question configuration"}
             
             # Answer should be a list of indices
@@ -165,49 +231,33 @@ class GameController:
             correct_answers_set = set(int(a) for a in correct_answers)
             
             # Calculate partial credit
-            # Correct selections: +points per correct answer
-            # Wrong selections: -points per wrong answer
-            correct_selections = user_answers_set & correct_answers_set  # Intersection
-            wrong_selections = user_answers_set - correct_answers_set    # User selected but not correct
-            missed_selections = correct_answers_set - user_answers_set   # Correct but not selected
+            correct_selections = user_answers_set & correct_answers_set
+            wrong_selections = user_answers_set - correct_answers_set
             
             total_correct = len(correct_answers_set)
             num_correct = len(correct_selections)
             num_wrong = len(wrong_selections)
             
-            # Calculate partial credit percentage
-            # Each correct answer is worth (100 / total_correct)%
-            # Each wrong answer deducts (100 / total_correct)%
             if total_correct > 0:
                 partial_credit = (num_correct - num_wrong) / total_correct
-                partial_credit = max(0.0, min(1.0, partial_credit))  # Clamp between 0 and 1
+                partial_credit = max(0.0, min(1.0, partial_credit))
             else:
                 partial_credit = 0.0
             
-            is_correct = user_answers_set == correct_answers_set  # Full credit only if exact match
-            
-            logger.info(f"🎯 Multi answer check: user={user_id}")
-            logger.info(f"   User answers: {user_answers_set}")
-            logger.info(f"   Correct answers: {correct_answers_set}")
-            logger.info(f"   ✅ Correct selections: {num_correct}/{total_correct}")
-            logger.info(f"   ❌ Wrong selections: {num_wrong}")
-            logger.info(f"   ⚠️ Missed selections: {len(missed_selections)}")
-            logger.info(f"   📊 Partial credit: {partial_credit * 100:.1f}%")
+            is_correct = user_answers_set == correct_answers_set
             
         elif question_type == "dragAndDrop":
             # Drag and drop questions
             correct_matches = question.get("correctMatches", {})
             if not correct_matches:
-                logger.error(f"❌ No correct matches found for drag-drop question {current_index}")
+                logger.error(f"No correct matches for drag-drop Q{current_index}")
                 return {"error": "Invalid question configuration"}
             
-            # Answer should be a dict/object of matches
             user_matches = answer if isinstance(answer, dict) else {}
             is_correct = user_matches == correct_matches
-            logger.info(f"🎯 Drag-drop check: user={user_id}, matches={user_matches}, correct={correct_matches}, is_correct={is_correct}")
         
         else:
-            logger.error(f"❌ Unknown question type: {question_type}")
+            logger.error(f"Unknown question type: {question_type}")
             return {"error": "Unknown question type"}
         
         # Calculate points (time-based scoring with multiplier)
@@ -220,6 +270,22 @@ class GameController:
         
         # Get per-question time limit
         question_time_limit = question.get('timeLimit', QUESTION_TIME_SECONDS)
+        
+        # SECURITY: Validate timestamp to prevent cheating
+        # - Negative timestamps are invalid (exploit attempt)
+        # - Timestamps faster than 0.5 seconds are suspicious (bot/cheat)
+        # - Timestamps beyond time limit get no time bonus
+        MIN_ANSWER_TIME = 0.5  # Minimum realistic human answer time
+        if timestamp is None or timestamp < 0:
+            timestamp = question_time_limit  # Treat as slowest possible
+            logger.warning(f"Invalid timestamp from {user_id}: using max time")
+        elif timestamp < MIN_ANSWER_TIME:
+            # Suspiciously fast - could be a bot, but still award points
+            logger.warning(f"Suspiciously fast answer from {user_id}: {timestamp:.2f}s")
+            timestamp = MIN_ANSWER_TIME  # Cap at minimum
+        elif timestamp > question_time_limit:
+            # Answered after time limit - no time bonus
+            timestamp = question_time_limit
         
         # For multi-choice, use partial credit
         if question_type == "multiMcq" and 'partial_credit' in locals():
@@ -237,15 +303,6 @@ class GameController:
             
             points = partial_points + time_bonus
             
-            if partial_credit == 1.0:
-                logger.info(f"✅ Perfect answer! Base: {base_points}, Time bonus: {time_bonus} (multiplier: {multiplier:.2f}x), Total: {points}")
-            elif partial_credit > 0:
-                logger.info(f"⚠️ Partial credit! Base: {base_points} × {partial_credit:.2f} = {partial_points}, Time bonus: {time_bonus}, Total: {points}")
-            else:
-                logger.info(f"❌ No points (wrong selections outweigh correct ones)")
-            
-            logger.info(f"⏱️ Time stats: elapsed={timestamp:.2f}s, limit={question_time_limit}s")
-            
         elif is_correct:
             # Full credit for other question types
             base_points = 1000
@@ -253,76 +310,137 @@ class GameController:
             
             # Calculate time-based multiplier
             if timestamp is not None and timestamp >= 0:
-                # Clamp elapsed time to question's time limit
                 elapsed = min(timestamp, question_time_limit)
-                # Calculate multiplier: 2.0 at 0 seconds, 1.0 at time limit
-                # Linear interpolation: multiplier = 2.0 - (elapsed / time_limit)
                 multiplier = max(1.0, 2.0 - (elapsed / question_time_limit))
-                # Time bonus is the extra points from speed (base * (multiplier - 1))
                 time_bonus = int(base_points * (multiplier - 1))
             
             points = base_points + time_bonus
-            logger.info(f"✅ Correct answer! Base: {base_points}, Time bonus: {time_bonus} (multiplier: {multiplier:.2f}x), Total: {points}")
-            logger.info(f"⏱️ Time stats: elapsed={timestamp:.2f}s, limit={question_time_limit}s")
         
-        # Update participant data
-        participants = json.loads(participants_json)
-        if user_id in participants:
-            participant = participants[user_id]
+        # ============================================================
+        # CRITICAL SECTION: Update participant data with session-wide lock
+        # This prevents race conditions where concurrent answers overwrite each other
+        # ============================================================
+        participants_lock_key = f"lock:participants:{session_code}"
+        max_lock_retries = 50
+        lock_timeout = 3
+        
+        for lock_attempt in range(max_lock_retries):
+            # Try to acquire session-wide participants lock
+            lock_acquired = await self.redis.set(
+                participants_lock_key,
+                user_id,
+                nx=True,
+                ex=lock_timeout
+            )
             
-            # Check if already answered
-            for ans in participant["answers"]:
-                if ans["question_index"] == current_index:
-                    logger.warning(f"⚠️ User {user_id} already answered question {current_index}")
-                    return {"error": "Already answered"}
+            if not lock_acquired:
+                await asyncio.sleep(0.02 * (lock_attempt + 1))
+                continue
             
-            # Record answer
-            participant["answers"].append({
-                "question_index": current_index,
-                "answer": answer,
-                "timestamp": timestamp,
-                "is_correct": is_correct,
-                "points_earned": points
-            })
-            participant["score"] += points
-            
-            # Save back to Redis
-            await self.redis.hset(session_key, "participants", json.dumps(participants))
-            
-            logger.info(f"💾 Saved answer for {user_id}: score now {participant['score']}")
-            
-            # Return correct answer based on question type
-            correct_answer_response = None
-            if question_type in ["singleMcq", "trueFalse"]:
-                correct_answer_response = str(question.get("correctAnswerIndex"))
-            elif question_type == "multiMcq":
-                correct_answer_response = question.get("correctAnswerIndices", [])
-            elif question_type == "dragAndDrop":
-                correct_answer_response = question.get("correctMatches", {})
-            
-            # Store the answer for returning
-            stored_answer = answer
-            
-            response = {
-                "is_correct": is_correct,
-                "points": points,
-                "time_bonus": time_bonus,
-                "multiplier": round(multiplier, 2),
-                "correct_answer": correct_answer_response,
-                "user_answer": stored_answer,
-                "new_total_score": participant["score"],
-                "question_type": question_type
-            }
-            
-            # Add partial credit info for multi-choice
-            if question_type == "multiMcq":
-                response["partial_credit"] = round(partial_credit_percentage, 1)
-                response["is_partial"] = partial_credit_percentage > 0 and partial_credit_percentage < 100
-            
-            return response
-            
-        logger.error(f"❌ Participant {user_id} not found in session")
-        return {"error": "Participant not found"}
+            try:
+                # === LOCKED: Read-modify-write participants ===
+                participants_json = await self.redis.hget(session_key, "participants")
+                if not participants_json:
+                    return {"error": "Session not found"}
+                
+                participants = json.loads(participants_json)
+                if user_id not in participants:
+                    logger.error(f"Participant {user_id} not found")
+                    return {"error": "Participant not found"}
+                
+                participant = participants[user_id]
+                
+                # Check if already answered
+                for ans in participant["answers"]:
+                    if ans["question_index"] == current_index:
+                        logger.debug(f"User {user_id} already answered Q{current_index}")
+                        return {"error": "Already answered"}
+                
+                # Record answer with validated timestamp
+                participant["answers"].append({
+                    "question_index": current_index,
+                    "answer": answer,
+                    "timestamp": timestamp,
+                    "is_correct": is_correct,
+                    "points_earned": points
+                })
+                
+                # Update score with overflow protection
+                MAX_SCORE = 10_000_000  # Prevent integer overflow exploits
+                new_score = participant["score"] + points
+                participant["score"] = min(new_score, MAX_SCORE)
+                
+                # Track total answer time for tie-breaking (faster total time wins)
+                if "total_answer_time" not in participant:
+                    participant["total_answer_time"] = 0.0
+                participant["total_answer_time"] += timestamp
+                
+                # Log BEFORE saving (debug level for production)
+                answers_count = len(participant["answers"])
+                logger.debug(f"Saving {user_id}: Q{current_index + 1}, answers={answers_count}")
+                
+                # Save back to Redis
+                await self.redis.hset(session_key, "participants", json.dumps(participants))
+                
+                # === END LOCKED SECTION ===
+                break
+                
+            finally:
+                # Always release the lock
+                await self.redis.delete(participants_lock_key)
+        else:
+            # Failed to acquire lock after all retries
+            logger.error(f"Failed to acquire participants lock for {user_id}")
+            return {"error": "Server busy, please try again"}
+        
+        # Verification (debug only - remove in production for performance)
+        if logger.isEnabledFor(logging.DEBUG):
+            verify_json = await self.redis.hget(session_key, "participants")
+            verify_participants = json.loads(verify_json)
+            if user_id in verify_participants:
+                verify_count = len(verify_participants[user_id].get("answers", []))
+                if verify_count != answers_count:
+                    logger.error(f"MISMATCH - {user_id}: expected {answers_count}, got {verify_count}")
+                else:
+                    logger.debug(f"Verified {user_id}: {verify_count} answers")
+        
+        # Return correct answer based on question type
+        correct_answer_response = None
+        if question_type in ["singleMcq", "trueFalse"]:
+            correct_answer_response = str(question.get("correctAnswerIndex"))
+        elif question_type == "multiMcq":
+            correct_answer_response = question.get("correctAnswerIndices", [])
+        elif question_type == "dragAndDrop":
+            correct_answer_response = question.get("correctMatches", {})
+        
+        # Store the answer for returning
+        stored_answer = answer
+        
+        # Get the updated score from what we saved
+        final_score = participant["score"]
+        
+        response = {
+            "is_correct": is_correct,
+            "points": points,
+            "time_bonus": time_bonus,
+            "multiplier": round(multiplier, 2),
+            "correct_answer": correct_answer_response,
+            "user_answer": stored_answer,
+            "new_total_score": final_score,
+            "question_type": question_type,
+            "question_index": current_index
+        }
+        
+        # Add partial credit info for multi-choice
+        if question_type == "multiMcq":
+            response["partial_credit"] = round(partial_credit_percentage, 1)
+            response["is_partial"] = partial_credit_percentage > 0 and partial_credit_percentage < 100
+        
+        # ✅ ADVANCE participant's question index immediately after answering
+        # This way request_next_question just needs to get the next question
+        await self.set_participant_question_index(session_code, user_id, current_index + 1)
+        
+        return response
 
     async def advance_question(self, session_code: str) -> bool:
         """Move to the next question"""
@@ -403,41 +521,42 @@ class GameController:
         return (correct_count / len(answers)) * 100
 
     async def get_participant_question_index(self, session_code: str, user_id: str) -> int:
-        """Get the current question index for a specific participant"""
-        session_key = f"session:{session_code}"
+        """Get the current question index for a specific participant (Redis is the source of truth)"""
         participant_key = f"participant:{session_code}:{user_id}:question_index"
         
-        # Try to get from Redis first
+        # Get from Redis - this is the single source of truth
         index = await self.redis.get(participant_key)
         
         if index is not None:
-            logger.info(f"📊 PROGRESS - Found cached index for {user_id}: {int(index)}")
-            return int(index)
+            # Handle edge case where Redis might return bytes or unexpected types
+            if isinstance(index, bytes):
+                index = index.decode('utf-8')
+            if isinstance(index, (str, int, float)):
+                return int(index)
+            # If it's a list or other type, log and return 0
+            logger.warning(f"Unexpected index type for {user_id}: {type(index)} = {index}")
+            return 0
         
-        # If not found, check their answers to determine progress
-        logger.info(f"🔍 PROGRESS - No cached index for {user_id}, checking answers")
-        participants_json = await self.redis.hget(session_key, "participants")
-        if participants_json:
-            participants = json.loads(participants_json)
-            if user_id in participants:
-                answers = participants[user_id].get("answers", [])
-                # Return the highest question index they've answered
-                if answers:
-                    max_index = max(ans["question_index"] for ans in answers)
-                    logger.info(f"📊 PROGRESS - Calculated index from answers for {user_id}: {max_index}")
-                    return max_index
-        
-        logger.info(f"📊 PROGRESS - No progress found for {user_id}, defaulting to 0")
-        return 0  # Default to first question
+        # Not initialized yet - default to 0
+        # This should only happen if they joined before quiz started
+        return 0
 
     async def set_participant_question_index(self, session_code: str, user_id: str, index: int):
         """Set the current question index for a specific participant"""
         participant_key = f"participant:{session_code}:{user_id}:question_index"
         await self.redis.set(participant_key, index)
-        logger.info(f"✅ PROGRESS - Set {user_id} question index to {index}")
 
     async def get_total_questions(self, session_code: str) -> int:
-        """Get total number of questions in the quiz"""
+        """Get total number of questions in the quiz (uses cached data)"""
+        # Try to get from cache first
+        cache_key = f"quiz_cache:{session_code}"
+        cached_quiz = await self.redis.get(cache_key)
+        
+        if cached_quiz:
+            quiz_data = json.loads(cached_quiz)
+            return len(quiz_data.get("questions", []))
+        
+        # Fallback to MongoDB and cache it
         session_key = f"session:{session_code}"
         quiz_id = await self.redis.hget(session_key, "quiz_id")
         
@@ -448,34 +567,56 @@ class GameController:
         if not quiz or "questions" not in quiz:
             return 0
         
+        # Cache the quiz for 1 hour
+        quiz_to_cache = {
+            "questions": quiz["questions"],
+            "quiz_id": quiz_id
+        }
+        await self.redis.setex(cache_key, 3600, json.dumps(quiz_to_cache))
+        
         return len(quiz["questions"])
 
     async def get_question_by_index(self, session_code: str, index: int) -> Optional[Dict[str, Any]]:
-        """Get a specific question by index"""
+        """Get a specific question by index (uses cached data for speed)"""
         session_key = f"session:{session_code}"
+        cache_key = f"quiz_cache:{session_code}"
         
-        logger.info(f"📚 Getting question {index} for session {session_code}")
+        logger.debug(f"Getting question {index} for session {session_code}")
         
-        # Get quiz ID and session time settings
-        session_data = await self.redis.hmget(session_key, ["quiz_id", "per_question_time_limit"])
-        quiz_id = session_data[0]
-        session_per_question_limit = int(session_data[1]) if session_data[1] else QUESTION_TIME_SECONDS
+        # Get session time settings
+        session_per_question_limit_raw = await self.redis.hget(session_key, "per_question_time_limit")
+        session_per_question_limit = int(session_per_question_limit_raw) if session_per_question_limit_raw else QUESTION_TIME_SECONDS
         
-        if not quiz_id:
-            logger.error(f"❌ Quiz ID not found for session {session_code}")
-            return None
+        # Try to get quiz from cache first
+        cached_quiz = await self.redis.get(cache_key)
         
-        # Fetch quiz from MongoDB
-        quiz = await quiz_collection.find_one({"_id": ObjectId(quiz_id)})
-        
-        if not quiz or "questions" not in quiz:
-            logger.error(f"❌ Quiz or questions not found")
-            return None
-        
-        questions = quiz["questions"]
+        if cached_quiz:
+            quiz_data = json.loads(cached_quiz)
+            questions = quiz_data.get("questions", [])
+        else:
+            # Fetch from MongoDB and cache
+            quiz_id = await self.redis.hget(session_key, "quiz_id")
+            
+            if not quiz_id:
+                logger.error(f"Quiz ID not found for session {session_code}")
+                return None
+            
+            quiz = await quiz_collection.find_one({"_id": ObjectId(quiz_id)})
+            
+            if not quiz or "questions" not in quiz:
+                logger.error(f"Quiz or questions not found")
+                return None
+            
+            questions = quiz["questions"]
+            
+            # Cache the quiz for 1 hour
+            quiz_to_cache = {
+                "questions": questions,
+                "quiz_id": quiz_id
+            }
+            await self.redis.setex(cache_key, 3600, json.dumps(quiz_to_cache))
         
         if index >= len(questions):
-            logger.warning(f"⚠️ Question index {index} out of range (total: {len(questions)})")
             return None
         
         question = questions[index]
@@ -485,10 +626,8 @@ class GameController:
         question_type = question.get('type', 'single')
         
         if not question_text or not question_text.strip():
-            logger.error(f"❌ Question {index} has empty question text!")
+            logger.error(f"Question {index} has empty text!")
             return None
-        
-        logger.info(f"✅ Retrieved question {index + 1}/{len(questions)}: {question_text[:50]}...")
         
         # Use session's per-question time limit (set by host)
         question_time_limit = session_per_question_limit

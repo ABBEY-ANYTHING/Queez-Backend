@@ -32,9 +32,16 @@ class LeaderboardManager:
         
         # Build leaderboard data
         leaderboard = []
+        incomplete_users = []
+        
         for user_id, participant in participants.items():
-            # Count answered questions
-            answered_count = len(participant.get("answers", []))
+            # Count answered questions from the answers array
+            answers = participant.get("answers", [])
+            answered_count = len(answers)
+            
+            # Track users who haven't finished for debugging
+            if answered_count < total_questions:
+                incomplete_users.append(f"{participant.get('username', 'Unknown')}={answered_count}/{total_questions}")
             
             leaderboard.append({
                 "user_id": user_id,
@@ -44,16 +51,19 @@ class LeaderboardManager:
                 "total_questions": total_questions,
                 "current_question": current_index + 1,
                 "is_connected": participant.get("connected", False),
+                "total_answer_time": participant.get("total_answer_time", 999999),  # For tie-breaking
             })
         
-        # Sort by score (descending), then by answered_count (ascending - faster is better)
-        leaderboard.sort(key=lambda x: (-x["score"], x["answered_count"]))
+        # Log summary instead of per-user details
+        if incomplete_users:
+            logger.debug(f"Leaderboard: {len(leaderboard)} users, {len(incomplete_users)} incomplete: {incomplete_users[:5]}{'...' if len(incomplete_users) > 5 else ''}")
+        
+        # Sort by: 1) score (descending), 2) total_answer_time (ascending - faster wins ties)
+        leaderboard.sort(key=lambda x: (-x["score"], x["total_answer_time"]))
         
         # Add position/rank
         for idx, entry in enumerate(leaderboard):
             entry["position"] = idx + 1
-        
-        logger.info(f"📊 Leaderboard for {session_code}: {len(leaderboard)} participants")
         
         return leaderboard
 

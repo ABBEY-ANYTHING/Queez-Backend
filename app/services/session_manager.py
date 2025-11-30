@@ -16,6 +16,28 @@ logger = logging.getLogger(__name__)
 class SessionManager:
     def __init__(self):
         self.redis = redis_client
+    
+    def _sanitize_username(self, username: str) -> str:
+        """Sanitize username to prevent XSS, empty names, and inappropriate content"""
+        import re
+        
+        if not username or not isinstance(username, str):
+            return "Anonymous"
+        
+        # Strip whitespace and limit length
+        username = username.strip()[:30]
+        
+        # Remove any HTML/script tags (XSS prevention)
+        username = re.sub(r'<[^>]*>', '', username)
+        
+        # Remove control characters and null bytes
+        username = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', username)
+        
+        # If empty after sanitization, use default
+        if not username:
+            return "Anonymous"
+        
+        return username
 
     async def create_session(self, quiz_id: str, host_id: str, mode: str = "live", 
                             per_question_time_limit: int = 30) -> str:
@@ -81,15 +103,18 @@ class SessionManager:
         session_key = f"session:{session_code}"
         lock_key = f"lock:session:{session_code}:participants"
         
+        # SECURITY: Validate and sanitize username
+        username = self._sanitize_username(username)
+        
         # Check if user is the host - hosts should NOT be in participant list
         host_id = await self.redis.hget(session_key, "host_id")
         if user_id == host_id:
             logger.info(f"Rejected participant join: {user_id} is the host of session {session_code}")
             return False
         
-        # Acquire distributed lock with retry
-        max_retries = 20
-        lock_timeout = 5  # Lock expires after 5 seconds
+        # Acquire distributed lock with retry - tuned for high concurrency (50+ users)
+        max_retries = 100  # More retries for high concurrency
+        lock_timeout = 3   # Shorter lock timeout - operations are fast
         
         for attempt in range(max_retries):
             try:
@@ -98,12 +123,15 @@ class SessionManager:
                     lock_key, 
                     user_id, 
                     nx=True,  # Only set if not exists
-                    ex=lock_timeout  # Expire after 5 seconds
+                    ex=lock_timeout  # Expire after 3 seconds
                 )
                 
                 if not lock_acquired:
-                    # Lock held by another process, wait and retry
-                    await asyncio.sleep(0.05 + (0.02 * attempt))  # 50ms + backoff
+                    # Lock held by another process, wait with jitter and retry
+                    # Random jitter prevents thundering herd
+                    jitter = random.uniform(0.01, 0.05)
+                    wait_time = jitter + (0.01 * min(attempt, 20))  # Cap backoff
+                    await asyncio.sleep(wait_time)
                     continue
                 
                 try:
@@ -115,12 +143,18 @@ class SessionManager:
                     
                     participants = json.loads(participants_json)
                     
+                    # LIMIT: Max 200 participants per session to prevent server overload
+                    MAX_PARTICIPANTS = 200
+                    if user_id not in participants and len(participants) >= MAX_PARTICIPANTS:
+                        logger.warning(f"Session {session_code} is full ({MAX_PARTICIPANTS} participants)")
+                        return False
+                    
                     # Add or update participant
                     if user_id in participants:
                         # Reconnecting user - preserve state
                         participants[user_id]["connected"] = True
                         participants[user_id]["username"] = username
-                        logger.info(f"🔄 Reconnecting participant {username} ({user_id}) to session {session_code}")
+                        logger.debug(f"🔄 Reconnecting participant {username} ({user_id})")
                     else:
                         # New participant
                         participants[user_id] = {
@@ -131,11 +165,16 @@ class SessionManager:
                             "score": 0,
                             "answers": []
                         }
-                        logger.info(f"🆕 Adding NEW participant {username} ({user_id}) to session {session_code}")
+                        logger.debug(f"New participant {username} ({user_id})")
                     
                     # Save updated participants
                     await self.redis.hset(session_key, "participants", json.dumps(participants))
-                    logger.info(f"✅ Successfully added {username} to session {session_code} (total: {len(participants)} participants)")
+                    logger.debug(f"Session {session_code} now has {len(participants)} participants")
+                    
+                    # Track this user's active session for reconnection
+                    active_session_key = f"user_active_session:{user_id}"
+                    await self.redis.set(active_session_key, session_code, ex=SESSION_EXPIRY_HOURS * 3600)
+                    
                     return True
                     
                 finally:
@@ -143,7 +182,7 @@ class SessionManager:
                     await self.redis.delete(lock_key)
                     
             except Exception as e:
-                logger.error(f"❌ Error adding participant {user_id} (attempt {attempt + 1}): {e}")
+                logger.error(f"Error adding participant {user_id} (attempt {attempt + 1}): {e}")
                 # Try to release lock in case of error
                 try:
                     await self.redis.delete(lock_key)
@@ -151,10 +190,10 @@ class SessionManager:
                     pass
                 if attempt == max_retries - 1:
                     return False
-                await asyncio.sleep(0.05 * (attempt + 1))
+                await asyncio.sleep(random.uniform(0.01, 0.05))
                 continue
         
-        logger.error(f"❌ Failed to add participant {user_id} after {max_retries} attempts (could not acquire lock)")
+        logger.error(f"Failed to add participant {user_id} after {max_retries} attempts")
         return False
 
     async def remove_participant(self, session_code: str, user_id: str):
@@ -169,19 +208,18 @@ class SessionManager:
 
     async def start_session(self, session_code: str, host_id: str) -> bool:
         """Transition session to active state"""
-        logger.info(f"🎮 Starting session {session_code} by host {host_id}")
+        logger.info(f"Starting session {session_code} by host {host_id}")
         
         session = await self.get_session(session_code)
         if not session:
-            logger.error(f"❌ Session {session_code} not found!")
+            logger.error(f"Session {session_code} not found")
             return False
             
         if session["host_id"] != host_id:
-            logger.error(f"❌ User {host_id} is not the host (actual host: {session['host_id']})")
+            logger.error(f"User {host_id} is not the host (actual host: {session['host_id']})")
             return False
         
-        logger.info(f"✅ Setting session {session_code} status to 'active'")
-        logger.info(f"📊 Session data: quiz_id={session.get('quiz_id')}, participants={len(session.get('participants', {}))}")
+        logger.info(f"Session {session_code} starting: quiz_id={session.get('quiz_id')}, participants={len(session.get('participants', {}))}")
         
         # Set status to active and record quiz start time
         await self.redis.hset(f"session:{session_code}", mapping={
@@ -191,8 +229,24 @@ class SessionManager:
         return True
 
     async def end_session(self, session_code: str) -> bool:
-        """Mark session as completed"""
-        await self.redis.hset(f"session:{session_code}", "status", "completed")
+        """Mark session as completed and clean up active session tracking"""
+        session_key = f"session:{session_code}"
+        
+        # Get participants and host to clean up their active session tracking
+        session = await self.get_session(session_code)
+        if session:
+            # Clean up host's active session
+            host_id = session.get("host_id")
+            if host_id:
+                await self.redis.delete(f"user_active_session:{host_id}")
+            
+            # Clean up all participants' active sessions
+            participants = session.get("participants", {})
+            for user_id in participants.keys():
+                await self.redis.delete(f"user_active_session:{user_id}")
+        
+        await self.redis.hset(session_key, "status", "completed")
+        logger.info(f"Session {session_code} ended and active session tracking cleaned up")
         return True
 
     async def is_host(self, session_code: str, user_id: str) -> bool:
