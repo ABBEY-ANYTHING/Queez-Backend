@@ -260,16 +260,22 @@ class GameController:
             logger.error(f"Unknown question type: {question_type}")
             return {"error": "Unknown question type"}
         
-        # Calculate points (time-based scoring with multiplier)
-        # Formula: 1000 base points + speed multiplier (up to 1000 bonus points)
+        # Calculate points (time-based scoring with multiplier + streak bonus)
+        # Formula: 1000 base points + speed multiplier (up to 1000 bonus points) + streak bonus
         # Faster answers get higher multipliers: 2x for instant, 1x at time limit
+        # Streak bonus: +10% per consecutive correct answer (max 50% at 5+ streak)
         points = 0
         time_bonus = 0
         multiplier = 1.0
         partial_credit_percentage = 0.0
+        streak_bonus = 0
+        current_streak = 0
         
         # Get per-question time limit
         question_time_limit = question.get('timeLimit', QUESTION_TIME_SECONDS)
+        
+        # Calculate current streak from participant's answer history
+        # (We'll get this after acquiring the lock, but calculate the logic here)
         
         # SECURITY: Validate timestamp to prevent cheating
         # - Negative timestamps are invalid (exploit attempt)
@@ -316,6 +322,8 @@ class GameController:
             
             points = base_points + time_bonus
         
+        # Streak bonus will be calculated after we read participant data (need answer history)
+        
         # ============================================================
         # CRITICAL SECTION: Update participant data with session-wide lock
         # This prevents race conditions where concurrent answers overwrite each other
@@ -356,13 +364,31 @@ class GameController:
                         logger.debug(f"User {user_id} already answered Q{current_index}")
                         return {"error": "Already answered"}
                 
-                # Record answer with validated timestamp
+                # Calculate streak bonus from answer history
+                # Count consecutive correct answers before this one
+                answers_sorted = sorted(participant["answers"], key=lambda x: x["question_index"], reverse=True)
+                current_streak = 0
+                for ans in answers_sorted:
+                    if ans.get("is_correct", False):
+                        current_streak += 1
+                    else:
+                        break
+                
+                # Apply streak bonus if this answer is correct (10% per streak, max 50%)
+                if is_correct and current_streak > 0:
+                    streak_multiplier = min(0.5, current_streak * 0.1)  # 10% per streak, max 50%
+                    streak_bonus = int(points * streak_multiplier)
+                    points += streak_bonus
+                    logger.debug(f"Streak bonus for {user_id}: {current_streak} streak = +{streak_bonus} pts")
+                
+                # Record answer with validated timestamp and streak info
                 participant["answers"].append({
                     "question_index": current_index,
                     "answer": answer,
                     "timestamp": timestamp,
                     "is_correct": is_correct,
-                    "points_earned": points
+                    "points_earned": points,
+                    "streak_bonus": streak_bonus if is_correct else 0
                 })
                 
                 # Update score with overflow protection
@@ -419,6 +445,9 @@ class GameController:
         # Get the updated score from what we saved
         final_score = participant["score"]
         
+        # Calculate new streak (current + 1 if correct, 0 if wrong)
+        new_streak = (current_streak + 1) if is_correct else 0
+        
         response = {
             "is_correct": is_correct,
             "points": points,
@@ -428,7 +457,9 @@ class GameController:
             "user_answer": stored_answer,
             "new_total_score": final_score,
             "question_type": question_type,
-            "question_index": current_index
+            "question_index": current_index,
+            "streak": new_streak,
+            "streak_bonus": streak_bonus if is_correct else 0
         }
         
         # Add partial credit info for multi-choice
