@@ -252,7 +252,7 @@ OUTPUT FORMAT (JSON):
       "title": "Unique note title (e.g., 'Summary: Cellular Processes')",
       "description": "Brief summary of note content",
       "category": "Category for this note",
-      "content": "{{\\"ops\\":[{{\\"insert\\":\\"Note content in Quill Delta format\\\\n\\"}}]}}"
+      "content": "Plain text content of the note. Write comprehensive notes with clear headings, bullet points, and explanations. Use \\n for line breaks."
     }}
   ]
 }}
@@ -364,11 +364,66 @@ IMPORTANT: Return ONLY valid JSON without any markdown formatting or code blocks
         for note_data in ai_response.get("notes", []):
             note_id = str(uuid.uuid4())
             
-            # Convert content to Quill Delta format if it's plain text
-            content = note_data.get("content", "")
-            if isinstance(content, str):
-                # Simple conversion to Quill Delta
-                content = {"ops": [{"insert": content + "\\n"}]}
+            # Get content and convert to proper Quill Delta format
+            raw_content = note_data.get("content", "")
+            
+            # Handle different content formats
+            content = None
+            
+            # If it's a dict, check if it's already proper Quill Delta
+            if isinstance(raw_content, dict):
+                if "ops" in raw_content:
+                    # Check if ops contains nested JSON string (double-encoded)
+                    ops = raw_content.get("ops", [])
+                    if ops and isinstance(ops[0], dict):
+                        insert_val = ops[0].get("insert", "")
+                        if isinstance(insert_val, str) and insert_val.startswith('{"ops"'):
+                            # Double-encoded - extract the inner content
+                            try:
+                                inner = json.loads(insert_val)
+                                content = inner
+                            except:
+                                content = raw_content
+                        else:
+                            content = raw_content
+                    else:
+                        content = raw_content
+                else:
+                    # Not proper Quill Delta, convert to plain text
+                    content = {"ops": [{"insert": str(raw_content) + "\n"}]}
+            elif isinstance(raw_content, str):
+                # Check if it's a JSON string
+                if raw_content.strip().startswith('{'):
+                    try:
+                        parsed = json.loads(raw_content)
+                        if isinstance(parsed, dict) and "ops" in parsed:
+                            # It's a Quill Delta JSON string
+                            # Check for double encoding
+                            ops = parsed.get("ops", [])
+                            if ops and isinstance(ops[0], dict):
+                                insert_val = ops[0].get("insert", "")
+                                if isinstance(insert_val, str) and insert_val.startswith('{"ops"'):
+                                    try:
+                                        inner = json.loads(insert_val)
+                                        content = inner
+                                    except:
+                                        content = parsed
+                                else:
+                                    content = parsed
+                            else:
+                                content = parsed
+                        else:
+                            # JSON but not Quill Delta - convert to delta
+                            content = {"ops": [{"insert": raw_content + "\n"}]}
+                    except json.JSONDecodeError:
+                        # Not valid JSON, treat as plain text
+                        content = {"ops": [{"insert": raw_content + "\n"}]}
+                else:
+                    # Plain text - convert to Quill Delta
+                    content = {"ops": [{"insert": raw_content + "\n"}]}
+            else:
+                # Fallback for any other type
+                content = {"ops": [{"insert": str(raw_content) + "\n"}]}
             
             note = {
                 "id": note_id,
