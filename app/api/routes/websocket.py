@@ -287,57 +287,83 @@ async def handle_join(websocket: WebSocket, session_code: str, user_id: str, pay
 
 
 async def auto_advance_question(session_code: str, time_limit: int, question_index: int):
-    """Auto-advance to next question after timeout"""
+    """Auto-advance: Send timeout to participants who haven't answered after time limit
+    
+    IMPORTANT: This does NOT broadcast next question to everyone. 
+    Each participant requests their own next question after answering/timeout.
+    This function only handles timeouts for participants who haven't answered.
+    """
     try:
         await asyncio.sleep(time_limit + 2)  # Wait for time limit + 2 second buffer
         
         # Check if session is still active
         session = await session_manager.get_session(session_code)
         if not session or session.get("status") != "active":
+            logger.debug(f"Session {session_code} no longer active, skipping auto-advance")
             return
         
-        # Check if we're still on the same question
         from app.core.database import redis_client
-        current_index = await redis_client.hget(f"session:{session_code}", "current_question_index")
-        if current_index and int(current_index) != question_index:
-            return
         
-        logger.debug(f"Auto-advancing session {session_code} past Q{question_index}")
+        # Get participants who are on this question but haven't answered
+        participants = session.get("participants", {})
+        total_questions = await game_controller.get_total_questions(session_code)
         
-        # Get next question
-        question_data = await game_controller.next_question(session_code)
-        
-        if question_data:
-            # Send next question to all
-            await manager.broadcast_to_session({
-                "type": "question",
-                "payload": question_data
-            }, session_code)
+        timeout_count = 0
+        for participant_id, participant_data in participants.items():
+            # Skip if not connected
+            if not participant_data.get("connected", True):
+                continue
             
-            # Start timer for next question
-            next_time_limit = question_data.get("time_limit", time_limit)
-            timer_key = f"{session_code}:{question_index + 1}"
-            active_timers[timer_key] = asyncio.create_task(
-                auto_advance_question(session_code, next_time_limit, question_index + 1)
-            )
-        else:
-            # No more questions - end quiz
-            logger.info(f"Quiz ended for session {session_code}")
-            await session_manager.end_session(session_code)
+            # Get participant's current question index
+            participant_index = await game_controller.get_participant_question_index(session_code, participant_id)
             
-            # Get final results
-            final_results = await leaderboard_manager.get_final_results(session_code)
+            # Only process if they're on the question that timed out
+            if participant_index != question_index:
+                continue
             
-            # Broadcast quiz end
-            await manager.broadcast_to_session({
-                "type": "quiz_ended",
+            # Check if they already answered this question
+            answers = participant_data.get("answers", [])
+            already_answered = any(a.get("question_index") == question_index for a in answers)
+            
+            if already_answered:
+                continue
+            
+            # Send timeout to this participant
+            timeout_count += 1
+            logger.debug(f"Timeout for {participant_id} on Q{question_index + 1}")
+            
+            # Send personal timeout notification
+            await manager.send_personal_message({
+                "type": "question_timeout",
                 "payload": {
-                    "message": "Quiz completed!",
-                    "results": final_results
+                    "question_index": question_index,
+                    "message": "Time's up for this question!"
                 }
-            }, session_code)
+            }, session_code=session_code, user_id=participant_id)
+            
+            # Auto-advance their question index (they get 0 points for timeout)
+            await game_controller.set_participant_question_index(session_code, participant_id, question_index + 1)
+            
+            # Check if they completed all questions
+            if question_index + 1 >= total_questions:
+                await check_all_participants_completed(session_code, total_questions)
+        
+        if timeout_count > 0:
+            logger.debug(f"Sent timeout to {timeout_count} participants for Q{question_index + 1}")
+        
+        # Start timer for next question index (for any participants who are there)
+        next_index = question_index + 1
+        if next_index < total_questions:
+            timer_key = f"{session_code}:{next_index}"
+            if timer_key not in active_timers:
+                active_timers[timer_key] = asyncio.create_task(
+                    auto_advance_question(session_code, time_limit, next_index)
+                )
+        
+    except asyncio.CancelledError:
+        logger.debug(f"Timer cancelled for {session_code}:Q{question_index}")
     except Exception as e:
-        logger.error(f"Auto-advance error: {e}")
+        logger.error(f"Auto-advance error: {e}", exc_info=True)
 
 
 async def handle_start_quiz(websocket: WebSocket, session_code: str, user_id: str, payload: dict = None):
@@ -432,14 +458,26 @@ async def handle_start_quiz(websocket: WebSocket, session_code: str, user_id: st
     # Get time settings for the quiz_started payload
     per_question_time_limit = int(session.get("per_question_time_limit", 30))
     
-    # Broadcast quiz started to all participants with time settings
-    await manager.broadcast_to_session({
+    logger.info(f"🚀 Starting quiz for session {session_code} with {len(participants)} participants")
+    
+    # Build quiz_started message
+    quiz_started_msg = {
         "type": "quiz_started",
         "payload": {
             "message": "Quiz is starting!",
             "per_question_time_limit": per_question_time_limit
         }
-    }, session_code)
+    }
+    
+    # IMPORTANT: Send to host FIRST to ensure they receive it
+    logger.info(f"📤 Sending quiz_started directly to host {user_id}")
+    await manager.send_personal_message(quiz_started_msg, websocket)
+    
+    # Then broadcast to all (this will also send to host, but that's OK - they'll ignore duplicates)
+    logger.info(f"📤 Broadcasting quiz_started to all in session {session_code}")
+    await manager.broadcast_to_session(quiz_started_msg, session_code)
+    
+    logger.info(f"📤 Broadcasting first question to session {session_code}")
     
     # Send first question to all participants
     await manager.broadcast_to_session({
@@ -519,6 +557,16 @@ async def handle_submit_answer(websocket: WebSocket, session_code: str, user_id:
             "type": "leaderboard_update",
             "payload": {"leaderboard": leaderboard}
         }, session_code)
+        
+        # ✅ Check if this participant has completed all questions
+        # This triggers quiz completion when all participants are done
+        question_index = result.get("question_index", 0)
+        total_questions = await game_controller.get_total_questions(session_code)
+        
+        # If they just answered the last question, check for completion
+        if question_index + 1 >= total_questions:
+            logger.debug(f"Participant {user_id} finished last question, checking for completion")
+            await check_all_participants_completed(session_code, total_questions)
     
     except Exception as e:
         logger.error(f"Error processing answer for {user_id}: {e}", exc_info=True)

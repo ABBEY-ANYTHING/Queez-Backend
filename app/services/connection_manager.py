@@ -128,21 +128,29 @@ class ConnectionManager:
     async def broadcast_to_session(self, message: dict, session_code: str):
         """Broadcast message to all participants in a session (with dead connection cleanup)"""
         if session_code not in self.session_connections:
+            logger.warning(f"No connections found for session {session_code}")
             return
         
         # Get snapshot of connections to avoid modification during iteration
         connections = dict(self.session_connections.get(session_code, {}))
         
         if not connections:
+            logger.warning(f"Empty connections for session {session_code}")
             return
         
+        msg_type = message.get("type", "unknown")
+        logger.info(f"Broadcasting '{msg_type}' to {len(connections)} users in session {session_code}")
+        
         dead_users = []
+        successful_users = []
         
         # Send to all connections concurrently with gather
         async def send_to_user(user_id: str, ws: WebSocket):
             success = await self._safe_send(ws, message, user_id)
             if not success:
                 dead_users.append(user_id)
+            else:
+                successful_users.append(user_id)
         
         # Use gather for parallel sends (much faster for 50+ users)
         await asyncio.gather(
@@ -150,9 +158,13 @@ class ConnectionManager:
             return_exceptions=True
         )
         
+        # Log success/failure
+        if successful_users:
+            logger.debug(f"Sent '{msg_type}' successfully to: {successful_users}")
+        
         # Clean up dead connections
         if dead_users:
-            logger.debug(f"Cleaning up {len(dead_users)} dead connections from session {session_code}")
+            logger.warning(f"Failed to send '{msg_type}' to {len(dead_users)} users: {dead_users}")
             for user_id in dead_users:
                 if session_code in self.session_connections:
                     if user_id in self.session_connections[session_code]:
