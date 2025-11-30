@@ -70,6 +70,11 @@ class SessionManager:
         await self.redis.hset(f"session:{session_code}", mapping=session_data)
         await self.redis.expire(f"session:{session_code}", SESSION_EXPIRY_HOURS * 3600)
         
+        # Track host's active session for reconnection
+        active_session_key = f"user_active_session:{host_id}"
+        await self.redis.set(active_session_key, session_code, ex=SESSION_EXPIRY_HOURS * 3600)
+        logger.info(f"Tracked host {host_id} active session: {session_code}")
+        
         return session_code
 
     async def _generate_unique_code(self) -> str:
