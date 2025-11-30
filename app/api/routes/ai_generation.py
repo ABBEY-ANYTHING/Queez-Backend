@@ -252,7 +252,11 @@ OUTPUT FORMAT (JSON):
       "title": "Unique note title (e.g., 'Summary: Cellular Processes')",
       "description": "Brief summary of note content",
       "category": "Category for this note",
-      "content": "{{\\"ops\\":[{{\\"insert\\":\\"Note content in Quill Delta format\\\\n\\"}}]}}"
+      "content": {{
+        "ops": [
+          {{"insert": "Your detailed note content here. Use \\n for line breaks within the text.\\n"}}
+        ]
+      }}
     }}
   ]
 }}
@@ -364,11 +368,18 @@ IMPORTANT: Return ONLY valid JSON without any markdown formatting or code blocks
         for note_data in ai_response.get("notes", []):
             note_id = str(uuid.uuid4())
             
-            # Convert content to Quill Delta format if it's plain text
-            content = note_data.get("content", "")
-            if isinstance(content, str):
-                # Simple conversion to Quill Delta
-                content = {"ops": [{"insert": content + "\\n"}]}
+            # Get content - should be Quill Delta format from Gemini
+            raw_content = note_data.get("content", "")
+            
+            # Ensure it's proper Quill Delta
+            if isinstance(raw_content, dict) and "ops" in raw_content:
+                # Already valid Quill Delta
+                content = raw_content
+            elif isinstance(raw_content, str):
+                # Plain text - convert to Quill Delta
+                content = {"ops": [{"insert": raw_content + "\n"}]}
+            else:
+                content = {"ops": [{"insert": str(raw_content) + "\n"}]}
             
             note = {
                 "id": note_id,
