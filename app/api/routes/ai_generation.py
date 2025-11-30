@@ -252,11 +252,7 @@ OUTPUT FORMAT (JSON):
       "title": "Unique note title (e.g., 'Summary: Cellular Processes')",
       "description": "Brief summary of note content",
       "category": "Category for this note",
-      "content": {{
-        "ops": [
-          {{"insert": "Your detailed note content here. Use \\n for line breaks within the text.\\n"}}
-        ]
-      }}
+      "content": "<h2>Section Title</h2><p>Your detailed note content here in HTML format. Use proper HTML tags like &lt;p&gt;, &lt;h2&gt;, &lt;ul&gt;, &lt;li&gt;, &lt;strong&gt;, &lt;em&gt; for formatting.</p>"
     }}
   ]
 }}
@@ -368,25 +364,29 @@ IMPORTANT: Return ONLY valid JSON without any markdown formatting or code blocks
         for note_data in ai_response.get("notes", []):
             note_id = str(uuid.uuid4())
             
-            # Get content - should be Quill Delta format from Gemini
+            # Get HTML content from Gemini and sanitize
             raw_content = note_data.get("content", "")
             
-            # Ensure it's proper Quill Delta
-            if isinstance(raw_content, dict) and "ops" in raw_content:
-                # Already valid Quill Delta
-                content = raw_content
-            elif isinstance(raw_content, str):
-                # Plain text - convert to Quill Delta
-                content = {"ops": [{"insert": raw_content + "\n"}]}
-            else:
-                content = {"ops": [{"insert": str(raw_content) + "\n"}]}
+            # Ensure content is a string (HTML)
+            if isinstance(raw_content, dict):
+                # If Gemini still returns dict, convert to simple HTML
+                raw_content = f"<p>{str(raw_content)}</p>"
+            elif not isinstance(raw_content, str):
+                raw_content = f"<p>{str(raw_content)}</p>"
+            
+            # Basic HTML sanitization - remove script tags and dangerous attributes
+            import re
+            content = re.sub(r'<script[^>]*>.*?</script>', '', raw_content, flags=re.DOTALL | re.IGNORECASE)
+            content = re.sub(r'\s(on\w+)=["\'][^"\']*["\']', '', content, flags=re.IGNORECASE)
+            content = re.sub(r'javascript:', '', content, flags=re.IGNORECASE)
             
             note = {
                 "id": note_id,
                 "title": note_data.get("title", f"Note {len(notes) + 1}"),
                 "description": note_data.get("description", note_data.get("summary", "")),
                 "category": note_data.get("category", study_set_metadata.get("category", "Other")),
-                "content": json.dumps(content) if isinstance(content, dict) else content,
+                "content": content,  # Store HTML directly
+                "contentType": "html",  # Mark as HTML content
                 "creatorId": user_id,
                 "createdAt": current_time,
                 "updatedAt": current_time
