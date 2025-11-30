@@ -46,7 +46,7 @@ class UploadUrlRequest(BaseModel):
 class GenerateStudySetRequest(BaseModel):
     fileUris: List[str]
     config: Optional[StudySetConfig] = None
-    settings: GenerationSettings
+    settings: Optional[GenerationSettings] = None
 
 @router.post("/get-upload-url")
 async def get_upload_url(
@@ -170,8 +170,6 @@ async def generate_study_set(
         model = genai.GenerativeModel('gemini-2.5-flash')
         
         logger.info(f"Generating AI study set from {len(request.fileUris)} files")
-        logger.info(f"Settings: {request.settings.quizCount} quizzes, {request.settings.flashcardSetCount} flashcard sets, {request.settings.noteCount} notes")
-        logger.info(f"Difficulty: {request.settings.difficulty}")
         
         # Get file objects from URIs
         files = []
@@ -188,17 +186,25 @@ async def generate_study_set(
         if not files:
             raise HTTPException(status_code=400, detail="Could not load any files")
         
-        # Build the prompt
-        prompt = f"""You are an expert educator creating study materials. Analyze the provided documents and generate a comprehensive study set with ALL metadata.
+        # Build the prompt - let Gemini decide content amounts
+        prompt = """You are an expert educator creating comprehensive study materials. Analyze the provided documents and generate a complete study set.
 
-GENERATE THE FOLLOWING:
-1. Study Set Metadata (name, description, category, language)
-2. {request.settings.quizCount} quizzes with {request.settings.questionsPerQuiz} multiple-choice questions each (each quiz has its own title, description, difficulty, category, language)
-3. {request.settings.flashcardSetCount} flashcard sets with {request.settings.cardsPerSet} cards each (each set has its own title, description, category)
-4. {request.settings.noteCount} comprehensive study notes (each note has its own title, description, category)
+YOUR TASK:
+1. Analyze the document content thoroughly
+2. Create an appropriate study set with metadata (name, description, category, language)
+3. Generate quizzes with multiple-choice questions
+4. Generate flashcard sets for key terms and concepts
+5. Generate comprehensive study notes
+
+YOU DECIDE:
+- How many quizzes to create (based on document length and topics - typically 1-5)
+- How many questions per quiz (based on content depth - typically 5-15)
+- How many flashcard sets to create (based on vocabulary/concepts - typically 1-3)
+- How many cards per set (based on terms to cover - typically 10-30)
+- How many notes to create (based on main topics - typically 1-3)
+- Difficulty level for each quiz (Easy, Medium, or Hard based on content complexity)
 
 REQUIREMENTS:
-- Analyze the document(s) and create an appropriate study set name and description
 - Determine the appropriate category (Science, Math, History, Language, Technology, Business, Arts, Health, Engineering, Social Studies, Philosophy, Psychology, Geography, Literature, Music, Sports, Law, Economics, Politics, Other)
 - Detect the language of the content
 - Extract key concepts, definitions, and important facts
@@ -206,56 +212,55 @@ REQUIREMENTS:
 - Ensure flashcards cover different aspects of the material
 - Notes should summarize main topics with examples
 - Use proper formatting and clear language
-- Match difficulty level: {request.settings.difficulty}
-- Each quiz, flashcard set, and note should have its own unique title, description, category, and language
+- Each quiz, flashcard set, and note should have its own unique title, description, and category
 
 OUTPUT FORMAT (JSON):
-{{
-  "studySet": {{
+{
+  "studySet": {
     "name": "Generated study set name based on document content",
     "description": "Comprehensive description of what this study set covers",
     "category": "Most appropriate category from the list above",
     "language": "Detected language (English, Spanish, French, etc.)"
-  }},
+  },
   "quizzes": [
-    {{
-      "title": "Unique quiz title (e.g., 'Chapter 1: Introduction to Biology')",
+    {
+      "title": "Unique quiz title",
       "description": "What this specific quiz covers",
       "difficulty": "Easy|Medium|Hard",
       "category": "Category for this quiz",
       "language": "Language for this quiz",
       "questions": [
-        {{
+        {
           "questionText": "Question text",
           "options": ["Option A", "Option B", "Option C", "Option D"],
           "correctOption": 0,
           "explanation": "Why this is correct"
-        }}
+        }
       ]
-    }}
+    }
   ],
   "flashcardSets": [
-    {{
-      "title": "Unique flashcard set title (e.g., 'Key Terms: Cell Biology')",
+    {
+      "title": "Unique flashcard set title",
       "description": "What this flashcard set focuses on",
       "category": "Category for this set",
       "cards": [
-        {{
+        {
           "front": "Term or question",
           "back": "Definition or answer"
-        }}
+        }
       ]
-    }}
+    }
   ],
   "notes": [
-    {{
-      "title": "Unique note title (e.g., 'Summary: Cellular Processes')",
+    {
+      "title": "Unique note title",
       "description": "Brief summary of note content",
       "category": "Category for this note",
-      "content": "<h2>Section Title</h2><p>Your detailed note content here in HTML format. Use proper HTML tags like &lt;p&gt;, &lt;h2&gt;, &lt;ul&gt;, &lt;li&gt;, &lt;strong&gt;, &lt;em&gt; for formatting.</p>"
-    }}
+      "content": "<h2>Section Title</h2><p>Your detailed note content in HTML format. Use proper HTML tags like p, h2, h3, ul, li, ol, strong, em for formatting. Make it comprehensive and well-structured.</p>"
+    }
   ]
-}}
+}
 
 IMPORTANT: Return ONLY valid JSON without any markdown formatting or code blocks. The JSON should be parseable directly."""
 
