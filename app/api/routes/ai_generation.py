@@ -333,7 +333,7 @@ IMPORTANT: Return ONLY valid JSON without any markdown formatting or code blocks
                 "description": quiz_data.get("description", ""),
                 "category": quiz_data.get("category", study_set_metadata.get("category", "Other")),
                 "language": quiz_data.get("language", study_set_metadata.get("language", "English")),
-                "difficulty": quiz_data.get("difficulty", request.settings.difficulty),
+                "difficulty": quiz_data.get("difficulty", "Medium"),
                 "creatorId": user_id,
                 "questions": questions,
                 "createdAt": current_time
