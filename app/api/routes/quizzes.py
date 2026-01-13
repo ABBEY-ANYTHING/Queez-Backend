@@ -391,7 +391,6 @@ async def add_quiz_to_library(data: dict):
         redis_session = await session_manager.get_session(quiz_code)
         
         if redis_session:
-            # This is a live multiplayer session - don't add to library
             quiz_id = redis_session.get("quiz_id")
             mode = redis_session.get("mode", "live")
             
@@ -401,12 +400,67 @@ async def add_quiz_to_library(data: dict):
             if not quiz:
                 raise HTTPException(status_code=404, detail="Quiz not found")
             
+            # For 'share' mode, we SHOULD save the quiz to user's library
+            # Only skip saving for actual live multiplayer modes
+            if mode == "live_multiplayer" or mode == "live":
+                return {
+                    "success": True,
+                    "mode": mode,
+                    "quiz_id": quiz_id,
+                    "quiz_title": quiz.get("title", "Untitled Quiz"),
+                    "message": "Live multiplayer session - playing host's quiz, not added to your library"
+                }
+            
+            # For 'share' mode (or other non-live modes in Redis), save to library
+            # Fall through to the save logic below
+            original_creator_id = quiz.get("creatorId")
+            
+            # Check if user already has this quiz
+            existing = await collection.find_one({
+                "creatorId": user_id,
+                "originalOwner": original_creator_id,
+                "title": quiz.get("title")
+            })
+            
+            if existing:
+                raise HTTPException(status_code=400, detail="You already have this quiz in your library")
+            
+            # Create a copy of the quiz for the user
+            new_quiz = {
+                "title": quiz.get("title"),
+                "description": quiz.get("description"),
+                "language": quiz.get("language"),
+                "category": quiz.get("category"),
+                "coverImagePath": quiz.get("coverImagePath"),
+                "creatorId": user_id,  # The user who is adding it
+                "originalOwner": original_creator_id,  # The original creator
+                "sharedMode": mode,  # Track which mode was used to share the quiz
+                "questions": quiz.get("questions"),
+                "createdAt": datetime.utcnow().strftime("%B, %Y")
+            }
+            
+            result = await collection.insert_one(new_quiz)
+            new_quiz_id = str(result.inserted_id)
+            
             return {
                 "success": True,
                 "mode": mode,
-                "quiz_id": quiz_id,
-                "quiz_title": quiz.get("title", "Untitled Quiz"),
-                "message": "Live multiplayer session - playing host's quiz, not added to your library"
+                "quiz_id": new_quiz_id,
+                "quiz_title": new_quiz.get("title", "Untitled Quiz"),
+                "message": "Quiz added to your library successfully",
+                "quiz_details": {
+                    "id": new_quiz_id,
+                    "title": new_quiz.get("title"),
+                    "description": new_quiz.get("description", ""),
+                    "coverImagePath": new_quiz.get("coverImagePath"),
+                    "createdAt": new_quiz.get("createdAt"),
+                    "questionCount": len(new_quiz.get("questions", [])),
+                    "language": new_quiz.get("language", ""),
+                    "category": new_quiz.get("category", ""),
+                    "originalOwner": new_quiz.get("originalOwner"),
+                    "originalOwnerUsername": None,
+                    "sharedMode": new_quiz.get("sharedMode")
+                }
             }
         
         # If not in Redis, check MongoDB for other session types (self_paced, timed_individual)
@@ -433,7 +487,6 @@ async def add_quiz_to_library(data: dict):
                 "quiz_title": quiz.get("title", "Untitled Quiz"),
                 "message": "Live multiplayer session - not saved to library"
             }
-        
         # For self_paced and timed_individual, save a copy to user's library
         # Check if user already has this quiz
         original_creator_id = quiz.get("creatorId")
