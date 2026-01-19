@@ -13,3 +13,7 @@ services:
         value: quiz_app
       - key: REDIS_URL
         sync: false
+      - key: GOOGLE_DRIVE_CREDENTIALS
+        sync: false
+      - key: GOOGLE_DRIVE_FOLDER_ID
+        sync: false
