@@ -11,3 +11,5 @@ python-socketio
 google-generativeai
 requests
 firebase-admin
+google-auth
+google-api-python-client

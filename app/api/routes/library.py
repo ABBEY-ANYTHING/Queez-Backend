@@ -10,20 +10,27 @@ quiz_collection = db["quizzes"]
 flashcard_collection = db["flashcard_sets"]
 note_collection = db["notes"]
 study_sets_collection = db["study_sets"]
+course_pack_collection = db["course_pack"]
 
 class LibraryItem(BaseModel):
     id: str
-    type: str  # "quiz", "flashcard", or "note"
+    type: str  # "quiz", "flashcard", "note", "study_set", or "course_pack"
     title: str
     description: str
     coverImagePath: str
     createdAt: str
     itemCount: int  # questionCount for quizzes, cardCount for flashcards, 0 for notes
     category: str
-    language: str = ""  # Only for quizzes
+    language: str = ""  # Only for quizzes and course packs
     originalOwner: str | None = None
     originalOwnerUsername: str | None = None
     sharedMode: str | None = None  # Only for quizzes
+    # Course pack specific fields
+    isPublic: bool = False
+    rating: float = 0.0
+    enrolledCount: int = 0
+    estimatedHours: float = 0.0
+    videoCount: int = 0
 
 class UnifiedLibraryResponse(BaseModel):
     success: bool
@@ -159,6 +166,41 @@ async def get_unified_library(user_id: str):
                 language=study_set.get("language", ""),
                 originalOwner=None,
                 originalOwnerUsername=None
+            ))
+        
+        # Fetch course packs from MongoDB
+        course_packs = []
+        try:
+            course_pack_cursor = course_pack_collection.find({"ownerId": user_id})
+            course_packs = await course_pack_cursor.to_list(length=None)
+        except Exception as e:
+            print(f"Error fetching course packs: {e}")
+        
+        # Convert course packs to LibraryItem
+        for course_pack in course_packs:
+            total_items = (
+                len(course_pack.get('quizzes', [])) +
+                len(course_pack.get('flashcardSets', [])) +
+                len(course_pack.get('notes', [])) +
+                len(course_pack.get('videoLectures', []))
+            )
+            library_items.append(LibraryItem(
+                id=str(course_pack["_id"]),
+                type="course_pack",
+                title=course_pack.get("name", "Untitled Course"),
+                description=course_pack.get("description", ""),
+                coverImagePath=course_pack.get("coverImagePath") or fallback_image,
+                createdAt=course_pack.get("createdAt", ""),
+                itemCount=total_items,
+                category=course_pack.get("category", ""),
+                language=course_pack.get("language", ""),
+                originalOwner=None,
+                originalOwnerUsername=None,
+                isPublic=course_pack.get("isPublic", False),
+                rating=course_pack.get("rating", 0.0),
+                enrolledCount=course_pack.get("enrolledCount", 0),
+                estimatedHours=course_pack.get("estimatedHours", 0.0),
+                videoCount=len(course_pack.get('videoLectures', []))
             ))
         
         # Sort by createdAt (most recent first)
