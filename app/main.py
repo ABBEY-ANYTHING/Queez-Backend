@@ -42,7 +42,6 @@ from app.api.routes import (
     websocket,
     live_multiplayer,
     notes,
-    study_sets,
     course_pack,
     ai_generation,
     video
@@ -67,7 +66,6 @@ app.add_middleware(
 app.include_router(quizzes.router)
 app.include_router(flashcards.router)
 app.include_router(notes.router)
-app.include_router(study_sets.router)
 app.include_router(course_pack.router)
 app.include_router(ai_generation.router)
 app.include_router(video.router)
