@@ -22,6 +22,22 @@ def generate_share_code(length=6):
     return ''.join(random.choice(characters) for _ in range(length))
 
 
+# Helper function to find study set by either MongoDB ObjectId or custom UUID
+async def find_study_set_by_id(study_set_id: str):
+    """Find a study set by either MongoDB _id (ObjectId) or custom id field (UUID)"""
+    study_set = None
+    
+    # First try as MongoDB ObjectId (24-character hex string)
+    if ObjectId.is_valid(study_set_id):
+        study_set = await study_sets_collection.find_one({"_id": ObjectId(study_set_id)})
+    
+    # If not found, try custom id field (UUID format)
+    if not study_set:
+        study_set = await study_sets_collection.find_one({"id": study_set_id})
+    
+    return study_set
+
+
 # Pydantic Models
 class Quiz(BaseModel):
     id: str
@@ -123,7 +139,7 @@ async def create_study_set(study_set: StudySetCreate):
 async def get_study_set(study_set_id: str):
     """Get a study set by ID"""
     try:
-        doc = await study_sets_collection.find_one({"_id": ObjectId(study_set_id)})
+        doc = await find_study_set_by_id(study_set_id)
         
         if not doc:
             raise HTTPException(
@@ -131,8 +147,10 @@ async def get_study_set(study_set_id: str):
                 detail="Study set not found"
             )
         
-        doc['id'] = str(doc['_id'])
-        del doc['_id']
+        # Normalize ID field
+        if '_id' in doc:
+            doc['id'] = str(doc['_id'])
+            del doc['_id']
         
         return {
             "success": True,
@@ -176,7 +194,7 @@ async def get_user_study_sets(user_id: str):
 async def update_study_set(study_set_id: str, study_set: StudySetCreate):
     """Update a study set"""
     try:
-        existing = await study_sets_collection.find_one({"_id": ObjectId(study_set_id)})
+        existing = await find_study_set_by_id(study_set_id)
         
         if not existing:
             raise HTTPException(
@@ -187,8 +205,14 @@ async def update_study_set(study_set_id: str, study_set: StudySetCreate):
         study_set_data = study_set.dict()
         study_set_data['updatedAt'] = datetime.utcnow().isoformat()
         
+        # Determine which field to use for the query
+        if '_id' in existing:
+            query = {"_id": existing['_id']}
+        else:
+            query = {"id": study_set_id}
+        
         await study_sets_collection.update_one(
-            {"_id": ObjectId(study_set_id)},
+            query,
             {"$set": study_set_data}
         )
         
@@ -209,7 +233,7 @@ async def update_study_set(study_set_id: str, study_set: StudySetCreate):
 async def delete_study_set(study_set_id: str):
     """Delete a study set"""
     try:
-        existing = await study_sets_collection.find_one({"_id": ObjectId(study_set_id)})
+        existing = await find_study_set_by_id(study_set_id)
         
         if not existing:
             raise HTTPException(
@@ -217,7 +241,13 @@ async def delete_study_set(study_set_id: str):
                 detail="Study set not found"
             )
         
-        await study_sets_collection.delete_one({"_id": ObjectId(study_set_id)})
+        # Determine which field to use for the query
+        if '_id' in existing:
+            query = {"_id": existing['_id']}
+        else:
+            query = {"id": study_set_id}
+        
+        await study_sets_collection.delete_one(query)
         
         return {
             "success": True,
@@ -236,7 +266,7 @@ async def delete_study_set(study_set_id: str):
 async def get_study_set_stats(study_set_id: str):
     """Get statistics for a study set"""
     try:
-        doc = await study_sets_collection.find_one({"_id": ObjectId(study_set_id)})
+        doc = await find_study_set_by_id(study_set_id)
         
         if not doc:
             raise HTTPException(
@@ -369,10 +399,8 @@ async def add_study_set_to_library(data: dict):
                 detail="Share code has expired"
             )
         
-        # Get the original study set
-        original_study_set = await study_sets_collection.find_one(
-            {"_id": ObjectId(session["study_set_id"])}
-        )
+        # Get the original study set (handles both ObjectId and UUID)
+        original_study_set = await find_study_set_by_id(session["study_set_id"])
         
         if not original_study_set:
             raise HTTPException(

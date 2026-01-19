@@ -1,15 +1,41 @@
 from fastapi import APIRouter, HTTPException, status
 from typing import List, Optional
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timedelta
 from bson import ObjectId
+import random
+import string
 
 from app.core.database import db
 
 router = APIRouter(prefix="/course-pack", tags=["Course Pack"])
 
-# Get course_pack collection
+# Get collections
 course_pack_collection = db["course_pack"]
+course_pack_sessions_collection = db["course_pack_sessions"]
+
+
+# Helper function to generate share code
+def generate_share_code(length=6):
+    """Generate a random alphanumeric share code"""
+    characters = string.ascii_uppercase + string.digits
+    return ''.join(random.choice(characters) for _ in range(length))
+
+
+# Helper function to find course pack by either MongoDB ObjectId or custom UUID
+async def find_course_pack_by_id(course_pack_id: str):
+    """Find a course pack by either MongoDB _id (ObjectId) or custom id field (UUID)"""
+    course_pack = None
+    
+    # First try as MongoDB ObjectId (24-character hex string)
+    if ObjectId.is_valid(course_pack_id):
+        course_pack = await course_pack_collection.find_one({"_id": ObjectId(course_pack_id)})
+    
+    # If not found, try custom id field (UUID format)
+    if not course_pack:
+        course_pack = await course_pack_collection.find_one({"id": course_pack_id})
+    
+    return course_pack
 
 
 # Pydantic Models
@@ -257,8 +283,10 @@ async def get_course_pack(course_pack_id: str):
                 detail="Course pack not found"
             )
         
-        doc['id'] = str(doc['_id'])
-        del doc['_id']
+        # Normalize ID field
+        if '_id' in doc:
+            doc['id'] = str(doc['_id'])
+            del doc['_id']
         
         return {
             "success": True,
@@ -302,7 +330,7 @@ async def get_user_course_packs(user_id: str):
 async def update_course_pack(course_pack_id: str, course_pack: CoursePackCreate):
     """Update a course pack"""
     try:
-        existing = await course_pack_collection.find_one({"_id": ObjectId(course_pack_id)})
+        existing = await find_course_pack_by_id(course_pack_id)
         
         if not existing:
             raise HTTPException(
@@ -314,8 +342,14 @@ async def update_course_pack(course_pack_id: str, course_pack: CoursePackCreate)
         course_pack_data['estimatedHours'] = calculate_estimated_hours(course_pack_data)
         course_pack_data['updatedAt'] = datetime.utcnow().isoformat()
         
+        # Determine which field to use for the query
+        if '_id' in existing:
+            query = {"_id": existing['_id']}
+        else:
+            query = {"id": course_pack_id}
+        
         await course_pack_collection.update_one(
-            {"_id": ObjectId(course_pack_id)},
+            query,
             {"$set": course_pack_data}
         )
         
@@ -543,7 +577,7 @@ async def remove_video_lecture(course_pack_id: str, video_id: str):
 async def delete_course_pack(course_pack_id: str):
     """Delete a course pack"""
     try:
-        existing = await course_pack_collection.find_one({"_id": ObjectId(course_pack_id)})
+        existing = await find_course_pack_by_id(course_pack_id)
         
         if not existing:
             raise HTTPException(
@@ -551,7 +585,13 @@ async def delete_course_pack(course_pack_id: str):
                 detail="Course pack not found"
             )
         
-        await course_pack_collection.delete_one({"_id": ObjectId(course_pack_id)})
+        # Determine which field to use for the query
+        if '_id' in existing:
+            query = {"_id": existing['_id']}
+        else:
+            query = {"id": course_pack_id}
+        
+        await course_pack_collection.delete_one(query)
         
         return {
             "success": True,
@@ -570,7 +610,7 @@ async def delete_course_pack(course_pack_id: str):
 async def get_course_pack_stats(course_pack_id: str):
     """Get statistics for a course pack"""
     try:
-        doc = await course_pack_collection.find_one({"_id": ObjectId(course_pack_id)})
+        doc = await find_course_pack_by_id(course_pack_id)
         
         if not doc:
             raise HTTPException(
@@ -617,51 +657,112 @@ async def get_course_pack_stats(course_pack_id: str):
         )
 
 
-class ClaimCoursePackRequest(BaseModel):
-    user_id: str
-
-
-@router.post("/{course_pack_id}/claim")
-async def claim_course_pack(course_pack_id: str, request: ClaimCoursePackRequest):
-    """Claim/copy a public course pack to user's library"""
+@router.post("/{course_pack_id}/create-share-code")
+async def create_course_pack_share_code(course_pack_id: str):
+    """Create a share code for a course pack (valid for 10 minutes)"""
     try:
-        user_id = request.user_id
+        # Verify course pack exists
+        course_pack = await find_course_pack_by_id(course_pack_id)
         
-        # Try to find by ObjectId first, then by custom id field
-        original = None
-        try:
-            original = await course_pack_collection.find_one({"_id": ObjectId(course_pack_id)})
-        except Exception:
-            pass
-        
-        if not original:
-            original = await course_pack_collection.find_one({"id": course_pack_id})
-        
-        if not original:
+        if not course_pack:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Course pack not found"
             )
         
-        # Check if the course is public
-        if not original.get('isPublic', False):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="This course pack is not available for claiming"
-            )
+        # Generate unique share code
+        share_code = generate_share_code()
         
-        # Check if user is the owner
-        if original.get('ownerId') == user_id:
+        # Ensure uniqueness
+        while await course_pack_sessions_collection.find_one({"share_code": share_code}):
+            share_code = generate_share_code()
+        
+        # Calculate expiration (10 minutes from now)
+        created_at = datetime.utcnow()
+        expires_at = created_at + timedelta(minutes=10)
+        expires_in = 600  # 10 minutes in seconds
+        
+        # Create share session document
+        session = {
+            "share_code": share_code,
+            "course_pack_id": course_pack_id,
+            "owner_id": course_pack.get("ownerId"),
+            "is_active": True,
+            "created_at": created_at,
+            "expires_at": expires_at,
+            "course_pack_name": course_pack.get("name", "Untitled Course Pack")
+        }
+        
+        await course_pack_sessions_collection.insert_one(session)
+        
+        return {
+            "success": True,
+            "share_code": share_code,
+            "expires_in": expires_in,
+            "expires_at": expires_at.isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error creating share code: {str(e)}"
+        )
+
+
+@router.post("/add-to-library")
+async def add_course_pack_to_library(data: dict):
+    """Add a course pack to user's library using a share code"""
+    try:
+        share_code = data.get("share_code")
+        user_id = data.get("user_id")
+        
+        if not share_code or not user_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="You already own this course pack"
+                detail="Missing share_code or user_id"
             )
         
+        # Find the share session
+        session = await course_pack_sessions_collection.find_one({"share_code": share_code})
+        
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Invalid or expired share code"
+            )
+        
+        # Check if expired
+        if session["expires_at"] < datetime.utcnow():
+            await course_pack_sessions_collection.delete_one({"share_code": share_code})
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail="Share code has expired"
+            )
+        
+        # Get the original course pack
+        original_course_pack = await find_course_pack_by_id(session["course_pack_id"])
+        
+        if not original_course_pack:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Course pack not found"
+            )
+        
+        original_owner_id = original_course_pack.get("ownerId")
+        
         # Check if user already has this course pack
+        if original_owner_id == user_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="You are the owner of this course pack"
+            )
+        
+        # Check if user already has a copy
         existing = await course_pack_collection.find_one({
             "ownerId": user_id,
-            "originalOwnerId": original.get('ownerId'),
-            "name": original.get('name')
+            "originalOwner": original_owner_id,
+            "name": original_course_pack.get("name")
         })
         
         if existing:
@@ -672,41 +773,33 @@ async def claim_course_pack(course_pack_id: str, request: ClaimCoursePackRequest
         
         # Create a copy of the course pack for the user
         new_course_pack = {
-            "id": str(ObjectId()),  # Generate new id
-            "name": original.get('name'),
-            "description": original.get('description'),
-            "category": original.get('category'),
-            "language": original.get('language'),
-            "coverImagePath": original.get('coverImagePath'),
+            "name": original_course_pack.get("name"),
+            "description": original_course_pack.get("description"),
+            "language": original_course_pack.get("language"),
+            "category": original_course_pack.get("category"),
+            "coverImagePath": original_course_pack.get("coverImagePath"),
             "ownerId": user_id,
-            "originalOwnerId": original.get('ownerId'),  # Track original owner
-            "quizzes": original.get('quizzes', []),
-            "flashcardSets": original.get('flashcardSets', []),
-            "notes": original.get('notes', []),
-            "videoLectures": original.get('videoLectures', []),
-            "isPublic": False,  # User's copy is private by default
+            "originalOwner": original_owner_id,
+            "quizzes": original_course_pack.get("quizzes", []),
+            "flashcardSets": original_course_pack.get("flashcardSets", []),
+            "notes": original_course_pack.get("notes", []),
+            "videoLectures": original_course_pack.get("videoLectures", []),
+            "isPublic": False,  # Copied course packs are private by default
             "rating": 0.0,
             "ratingCount": 0,
             "enrolledCount": 0,
-            "estimatedHours": original.get('estimatedHours', 0),
+            "estimatedHours": original_course_pack.get("estimatedHours", 0.0),
             "createdAt": datetime.utcnow().strftime("%B, %Y"),
             "updatedAt": datetime.utcnow().isoformat()
         }
         
         result = await course_pack_collection.insert_one(new_course_pack)
-        
-        # Increment the enrollment count on the original
-        try:
-            await course_pack_collection.update_one(
-                {"_id": original['_id']},
-                {"$inc": {"enrolledCount": 1}}
-            )
-        except Exception:
-            pass  # Don't fail if increment fails
+        new_course_pack_id = str(result.inserted_id)
         
         return {
             "success": True,
-            "course_pack_id": str(result.inserted_id),
+            "course_pack_id": new_course_pack_id,
+            "course_pack_name": new_course_pack.get("name", "Untitled Course Pack"),
             "message": "Course pack added to your library successfully"
         }
     except HTTPException:
@@ -714,5 +807,5 @@ async def claim_course_pack(course_pack_id: str, request: ClaimCoursePackRequest
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to claim course pack: {str(e)}"
+            detail=f"Error adding course pack: {str(e)}"
         )

@@ -9,12 +9,11 @@ router = APIRouter(prefix="/library", tags=["library"])
 quiz_collection = db["quizzes"]
 flashcard_collection = db["flashcard_sets"]
 note_collection = db["notes"]
-study_sets_collection = db["study_sets"]
 course_pack_collection = db["course_pack"]
 
 class LibraryItem(BaseModel):
     id: str
-    type: str  # "quiz", "flashcard", "note", "study_set", or "course_pack"
+    type: str  # "quiz", "flashcard", "note", or "course_pack"
     title: str
     description: str
     coverImagePath: str
@@ -37,7 +36,7 @@ class UnifiedLibraryResponse(BaseModel):
     data: List[LibraryItem]
     count: int
 
-@router.get("/{user_id}", response_model=UnifiedLibraryResponse, summary="Get all quizzes, flashcards, and notes for a user")
+@router.get("/{user_id}", response_model=UnifiedLibraryResponse, summary="Get all quizzes, flashcards, notes, and course packs for a user")
 async def get_unified_library(user_id: str):
     try:
         fallback_image = "https://img.freepik.com/free-vector/student-asking-teacher-concept-illustration_114360-19831.jpg?ga=GA1.1.377073698.1750732876&semt=ais_items_boosted&w=740"
@@ -90,15 +89,6 @@ async def get_unified_library(user_id: str):
         )
         notes = await note_cursor.to_list(length=None)
         
-        # Fetch study sets from MongoDB
-        study_sets = []
-        try:
-            study_sets_cursor = study_sets_collection.find({"ownerId": user_id})
-            study_sets = await study_sets_cursor.to_list(length=None)
-        except Exception as e:
-            print(f"Error fetching study sets: {e}")
-            # Continue even if study sets fail
-        
         # Convert quizzes to LibraryItem
         library_items = []
         for quiz in quizzes:
@@ -143,29 +133,6 @@ async def get_unified_library(user_id: str):
                 createdAt=note.get("createdAt", ""),
                 itemCount=0,  # Notes don't have a count
                 category=note.get("category", ""),
-                originalOwner=None,
-                originalOwnerUsername=None
-            ))
-        
-        # Convert study sets to LibraryItem
-        for study_set in study_sets:
-            total_items = (
-                len(study_set.get('quizzes', [])) +
-                len(study_set.get('flashcardSets', [])) +
-                len(study_set.get('notes', []))
-            )
-            # Use custom 'id' field if exists, otherwise use MongoDB _id
-            study_set_id = study_set.get("id") or str(study_set["_id"])
-            library_items.append(LibraryItem(
-                id=study_set_id,
-                type="study_set",
-                title=study_set.get("name", "Untitled Study Set"),
-                description=study_set.get("description", ""),
-                coverImagePath=study_set.get("coverImagePath") or fallback_image,
-                createdAt=study_set.get("createdAt", ""),
-                itemCount=total_items,
-                category=study_set.get("category", ""),
-                language=study_set.get("language", ""),
                 originalOwner=None,
                 originalOwnerUsername=None
             ))
