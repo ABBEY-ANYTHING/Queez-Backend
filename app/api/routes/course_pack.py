@@ -483,6 +483,112 @@ async def enroll_in_course_pack(course_pack_id: str, user_id: str):
         )
 
 
+class ClaimCourseRequest(BaseModel):
+    user_id: str
+
+
+@router.post("/{course_pack_id}/claim")
+async def claim_course_pack(course_pack_id: str, request: ClaimCourseRequest):
+    """Claim/copy a public course pack to user's library"""
+    try:
+        user_id = request.user_id
+        
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Missing user_id"
+            )
+        
+        # Get the original course pack
+        original_course_pack = await find_course_pack_by_id(course_pack_id)
+        
+        if not original_course_pack:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Course pack not found"
+            )
+        
+        # Check if course pack is public
+        if not original_course_pack.get("isPublic", False):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This course pack is not available for claiming"
+            )
+        
+        original_owner_id = original_course_pack.get("ownerId")
+        
+        # Check if user is the owner
+        if original_owner_id == user_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="You are the owner of this course pack"
+            )
+        
+        # Check if user already has a copy (check by originalCoursePackId)
+        original_id = str(original_course_pack.get("_id", original_course_pack.get("id", "")))
+        existing = await course_pack_collection.find_one({
+            "ownerId": user_id,
+            "originalCoursePackId": original_id
+        })
+        
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="You already have this course pack in your library"
+            )
+        
+        # Create a copy of the course pack for the user
+        new_course_pack = {
+            "name": original_course_pack.get("name"),
+            "description": original_course_pack.get("description"),
+            "language": original_course_pack.get("language"),
+            "category": original_course_pack.get("category"),
+            "coverImagePath": original_course_pack.get("coverImagePath"),
+            "ownerId": user_id,
+            "originalOwner": original_owner_id,
+            "originalCoursePackId": original_id,
+            "quizzes": original_course_pack.get("quizzes", []),
+            "flashcardSets": original_course_pack.get("flashcardSets", []),
+            "notes": original_course_pack.get("notes", []),
+            "videoLectures": original_course_pack.get("videoLectures", []),
+            "isPublic": False,  # Claimed course packs are private by default
+            "rating": 0.0,
+            "ratingCount": 0,
+            "enrolledCount": 0,
+            "estimatedHours": original_course_pack.get("estimatedHours", 0.0),
+            "createdAt": datetime.utcnow().strftime("%B, %Y"),
+            "updatedAt": datetime.utcnow().isoformat()
+        }
+        
+        result = await course_pack_collection.insert_one(new_course_pack)
+        new_course_pack_id = str(result.inserted_id)
+        
+        # Increment enrolled count on original course pack
+        if "_id" in original_course_pack:
+            await course_pack_collection.update_one(
+                {"_id": original_course_pack["_id"]},
+                {"$inc": {"enrolledCount": 1}}
+            )
+        else:
+            await course_pack_collection.update_one(
+                {"id": original_id},
+                {"$inc": {"enrolledCount": 1}}
+            )
+        
+        return {
+            "success": True,
+            "course_pack_id": new_course_pack_id,
+            "message": "Course pack added to your library successfully"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to claim course pack: {str(e)}"
+        )
+
+
 @router.post("/{course_pack_id}/rate")
 async def rate_course_pack(course_pack_id: str, rating: float):
     """Rate a course pack (updates average rating)"""
