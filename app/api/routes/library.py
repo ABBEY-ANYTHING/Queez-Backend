@@ -10,7 +10,6 @@ quiz_collection = db["quizzes"]
 flashcard_collection = db["flashcard_sets"]
 note_collection = db["notes"]
 course_pack_collection = db["course_pack"]
-study_sets_collection = db["study_sets"]
 
 class LibraryItem(BaseModel):
     id: str
@@ -171,6 +170,38 @@ async def get_unified_library(user_id: str):
                 enrolledCount=course_pack.get("enrolledCount", 0),
                 estimatedHours=course_pack.get("estimatedHours", 0.0),
                 videoCount=len(course_pack.get('videoLectures', []))
+            ))
+        
+        # Fetch study sets from MongoDB
+        study_sets = []
+        try:
+            study_set_cursor = study_sets_collection.find({"ownerId": user_id})
+            study_sets = await study_set_cursor.to_list(length=None)
+        except Exception as e:
+            print(f"Error fetching study sets: {e}")
+        
+        # Convert study sets to LibraryItem
+        for study_set in study_sets:
+            # Use the custom 'id' field if it exists, otherwise use MongoDB _id
+            study_set_id = study_set.get("id", str(study_set["_id"]))
+            
+            total_items = (
+                len(study_set.get('quizzes', [])) +
+                len(study_set.get('flashcardSets', [])) +
+                len(study_set.get('notes', []))
+            )
+            library_items.append(LibraryItem(
+                id=study_set_id,
+                type="study_set",
+                title=study_set.get("name", "Untitled Study Set"),
+                description=study_set.get("description", ""),
+                coverImagePath=study_set.get("coverImagePath") or fallback_image,
+                createdAt=study_set.get("createdAt", ""),
+                itemCount=total_items,
+                category=study_set.get("category", ""),
+                language=study_set.get("language", ""),
+                originalOwner=study_set.get("originalOwner"),
+                originalOwnerUsername=None
             ))
         
         # Fetch study sets from MongoDB
