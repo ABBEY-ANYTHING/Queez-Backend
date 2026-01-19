@@ -91,5 +91,10 @@ async def root():
         "endpoints": "/docs for API documentation"
     }
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for server wake-up pings"""
+    return {"status": "ok", "version": APP_VERSION}
+
 # Local development:
 # uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
