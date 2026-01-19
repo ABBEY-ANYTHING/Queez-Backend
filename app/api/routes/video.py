@@ -41,9 +41,15 @@ async def upload_video(
     Returns the file ID and shareable link.
     """
     try:
+        print(f"📹 [VIDEO_UPLOAD] Starting upload...")
+        print(f"📹 [VIDEO_UPLOAD] Filename: {file.filename}")
+        print(f"📹 [VIDEO_UPLOAD] Content-Type: {file.content_type}")
+        print(f"📹 [VIDEO_UPLOAD] Title: {title}")
+        
         # Check file size (limit to 100MB)
         content = await file.read()
         file_size = len(content)
+        print(f"📹 [VIDEO_UPLOAD] File size: {file_size} bytes ({file_size / (1024*1024):.2f} MB)")
         
         if file_size > 100 * 1024 * 1024:  # 100MB
             raise HTTPException(
@@ -63,6 +69,8 @@ async def upload_video(
                     detail="Invalid file type. Please upload a video file."
                 )
         
+        print(f"📹 [VIDEO_UPLOAD] Calling upload_video_to_drive...")
+        
         # Upload to Google Drive
         result = upload_video_to_drive(
             file_content=content,
@@ -70,7 +78,10 @@ async def upload_video(
             title=title
         )
         
+        print(f"📹 [VIDEO_UPLOAD] Upload result: {result}")
+        
         if result:
+            print(f"📹 [VIDEO_UPLOAD] ✅ Success! File ID: {result['fileId']}")
             return VideoUploadResponse(
                 success=True,
                 fileId=result['fileId'],
@@ -78,6 +89,7 @@ async def upload_video(
                 name=result['name']
             )
         else:
+            print(f"📹 [VIDEO_UPLOAD] ❌ Failed - result is None")
             raise HTTPException(
                 status_code=500,
                 detail="Failed to upload video to Google Drive"
@@ -86,6 +98,9 @@ async def upload_video(
     except HTTPException:
         raise
     except Exception as e:
+        print(f"📹 [VIDEO_UPLOAD] ❌ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
             detail=f"Error uploading video: {str(e)}"
