@@ -592,3 +592,104 @@ async def get_course_pack_stats(course_pack_id: str):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to fetch course pack stats: {str(e)}"
         )
+
+
+class ClaimCoursePackRequest(BaseModel):
+    user_id: str
+
+
+@router.post("/{course_pack_id}/claim")
+async def claim_course_pack(course_pack_id: str, request: ClaimCoursePackRequest):
+    """Claim/copy a public course pack to user's library"""
+    try:
+        user_id = request.user_id
+        
+        # Try to find by ObjectId first, then by custom id field
+        original = None
+        try:
+            original = await course_pack_collection.find_one({"_id": ObjectId(course_pack_id)})
+        except Exception:
+            pass
+        
+        if not original:
+            original = await course_pack_collection.find_one({"id": course_pack_id})
+        
+        if not original:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Course pack not found"
+            )
+        
+        # Check if the course is public
+        if not original.get('isPublic', False):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This course pack is not available for claiming"
+            )
+        
+        # Check if user is the owner
+        if original.get('ownerId') == user_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="You already own this course pack"
+            )
+        
+        # Check if user already has this course pack
+        existing = await course_pack_collection.find_one({
+            "ownerId": user_id,
+            "originalOwnerId": original.get('ownerId'),
+            "name": original.get('name')
+        })
+        
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="You already have this course pack in your library"
+            )
+        
+        # Create a copy of the course pack for the user
+        new_course_pack = {
+            "id": str(ObjectId()),  # Generate new id
+            "name": original.get('name'),
+            "description": original.get('description'),
+            "category": original.get('category'),
+            "language": original.get('language'),
+            "coverImagePath": original.get('coverImagePath'),
+            "ownerId": user_id,
+            "originalOwnerId": original.get('ownerId'),  # Track original owner
+            "quizzes": original.get('quizzes', []),
+            "flashcardSets": original.get('flashcardSets', []),
+            "notes": original.get('notes', []),
+            "videoLectures": original.get('videoLectures', []),
+            "isPublic": False,  # User's copy is private by default
+            "rating": 0.0,
+            "ratingCount": 0,
+            "enrolledCount": 0,
+            "estimatedHours": original.get('estimatedHours', 0),
+            "createdAt": datetime.utcnow().strftime("%B, %Y"),
+            "updatedAt": datetime.utcnow().isoformat()
+        }
+        
+        result = await course_pack_collection.insert_one(new_course_pack)
+        
+        # Increment the enrollment count on the original
+        try:
+            await course_pack_collection.update_one(
+                {"_id": original['_id']},
+                {"$inc": {"enrolledCount": 1}}
+            )
+        except Exception:
+            pass  # Don't fail if increment fails
+        
+        return {
+            "success": True,
+            "course_pack_id": str(result.inserted_id),
+            "message": "Course pack added to your library successfully"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to claim course pack: {str(e)}"
+        )
