@@ -240,7 +240,16 @@ async def get_featured_course_packs(limit: int = 5):
 async def get_course_pack(course_pack_id: str):
     """Get a course pack by ID"""
     try:
-        doc = await course_pack_collection.find_one({"_id": ObjectId(course_pack_id)})
+        # Try to find by ObjectId first, then by custom id field
+        doc = None
+        
+        try:
+            doc = await course_pack_collection.find_one({"_id": ObjectId(course_pack_id)})
+        except Exception:
+            pass  # Invalid ObjectId format, try custom id
+        
+        if not doc:
+            doc = await course_pack_collection.find_one({"id": course_pack_id})
         
         if not doc:
             raise HTTPException(
@@ -327,7 +336,21 @@ async def update_course_pack(course_pack_id: str, course_pack: CoursePackCreate)
 async def publish_course_pack(course_pack_id: str, publish_data: CoursePackPublish):
     """Publish or unpublish a course pack to marketplace"""
     try:
-        existing = await course_pack_collection.find_one({"_id": ObjectId(course_pack_id)})
+        # Try to find by ObjectId first, then by custom id field
+        existing = None
+        mongo_id = None
+        
+        try:
+            existing = await course_pack_collection.find_one({"_id": ObjectId(course_pack_id)})
+            if existing:
+                mongo_id = existing["_id"]
+        except Exception:
+            pass  # Invalid ObjectId format, try custom id
+        
+        if not existing:
+            existing = await course_pack_collection.find_one({"id": course_pack_id})
+            if existing:
+                mongo_id = existing["_id"]
         
         if not existing:
             raise HTTPException(
@@ -336,7 +359,7 @@ async def publish_course_pack(course_pack_id: str, publish_data: CoursePackPubli
             )
         
         await course_pack_collection.update_one(
-            {"_id": ObjectId(course_pack_id)},
+            {"_id": mongo_id},
             {"$set": {"isPublic": publish_data.isPublic, "updatedAt": datetime.utcnow().isoformat()}}
         )
         
