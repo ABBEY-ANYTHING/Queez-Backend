@@ -1,10 +1,11 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Request
 from typing import List, Optional
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 from bson import ObjectId
 import random
 import string
+import traceback
 
 from app.core.database import db
 
@@ -46,10 +47,12 @@ class Quiz(BaseModel):
     category: str
     language: str
     coverImagePath: Optional[str] = None
-    ownerId: str
+    # Support both ownerId and creatorId for backward compatibility
+    ownerId: Optional[str] = None
+    creatorId: Optional[str] = None
     questions: List[dict]
     createdAt: str
-    updatedAt: str
+    updatedAt: Optional[str] = None  # Made optional for frontend compatibility
 
 
 class Flashcard(BaseModel):
@@ -164,33 +167,72 @@ def calculate_estimated_hours(course_data: dict) -> float:
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
-async def create_course_pack(course_pack: CoursePackCreate):
+async def create_course_pack(request: Request):
     """Create a new course pack"""
     try:
-        course_pack_data = course_pack.dict()
+        # Parse request body manually for better error handling
+        try:
+            course_pack_data = await request.json()
+        except Exception as json_error:
+            print(f"JSON parsing error: {json_error}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid JSON: {str(json_error)}"
+            )
+        
+        print(f"Received course pack data with id: {course_pack_data.get('id', 'N/A')}")
+        print(f"Number of quizzes: {len(course_pack_data.get('quizzes', []))}")
+        
+        # Validate required fields
+        required_fields = ['id', 'name', 'ownerId']
+        missing_fields = [f for f in required_fields if not course_pack_data.get(f)]
+        if missing_fields:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Missing required fields: {missing_fields}"
+            )
         
         # Calculate estimated hours
         course_pack_data['estimatedHours'] = calculate_estimated_hours(course_pack_data)
         
         # Initialize marketplace fields
-        course_pack_data['rating'] = 0.0
-        course_pack_data['ratingCount'] = 0
-        course_pack_data['enrolledCount'] = 0
+        course_pack_data['rating'] = course_pack_data.get('rating', 0.0)
+        course_pack_data['ratingCount'] = course_pack_data.get('ratingCount', 0)
+        course_pack_data['enrolledCount'] = course_pack_data.get('enrolledCount', 0)
         
         # Format timestamps
         now = datetime.utcnow()
         course_pack_data['createdAt'] = now.strftime("%B, %Y")
         course_pack_data['updatedAt'] = datetime.utcnow().isoformat()
         
+        # Ensure defaults for optional fields
+        course_pack_data.setdefault('description', '')
+        course_pack_data.setdefault('category', 'General')
+        course_pack_data.setdefault('language', 'English')
+        course_pack_data.setdefault('coverImagePath', None)
+        course_pack_data.setdefault('quizzes', [])
+        course_pack_data.setdefault('flashcardSets', [])
+        course_pack_data.setdefault('notes', [])
+        course_pack_data.setdefault('videoLectures', [])
+        course_pack_data.setdefault('isPublic', False)
+        
+        print(f"Saving course pack to MongoDB...")
+        
         # Save to MongoDB
         result = await course_pack_collection.insert_one(course_pack_data)
+        
+        print(f"Course pack saved with id: {result.inserted_id}")
         
         return {
             "id": str(result.inserted_id),
             "success": True,
             "message": "Course pack created successfully"
         }
+    except HTTPException:
+        raise
     except Exception as e:
+        print(f"Error creating course pack: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create course pack: {str(e)}"
