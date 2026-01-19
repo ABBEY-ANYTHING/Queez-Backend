@@ -154,8 +154,10 @@ async def get_unified_library(user_id: str):
                 len(study_set.get('flashcardSets', [])) +
                 len(study_set.get('notes', []))
             )
+            # Use custom 'id' field if exists, otherwise use MongoDB _id
+            study_set_id = study_set.get("id") or str(study_set["_id"])
             library_items.append(LibraryItem(
-                id=str(study_set["_id"]),
+                id=study_set_id,
                 type="study_set",
                 title=study_set.get("name", "Untitled Study Set"),
                 description=study_set.get("description", ""),

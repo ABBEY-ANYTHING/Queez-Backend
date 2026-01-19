@@ -280,8 +280,19 @@ async def get_study_set_stats(study_set_id: str):
 async def create_study_set_share_code(study_set_id: str):
     """Create a share code for a study set (valid for 10 minutes)"""
     try:
-        # Verify study set exists
-        study_set = await study_sets_collection.find_one({"_id": ObjectId(study_set_id)})
+        # Verify study set exists - try both _id (ObjectId) and custom id field
+        study_set = None
+        
+        # First try as MongoDB ObjectId
+        try:
+            study_set = await study_sets_collection.find_one({"_id": ObjectId(study_set_id)})
+        except Exception:
+            pass  # Invalid ObjectId format, try custom id
+        
+        # If not found, try custom id field
+        if not study_set:
+            study_set = await study_sets_collection.find_one({"id": study_set_id})
+        
         if not study_set:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
