@@ -1,8 +1,10 @@
 from fastapi import APIRouter, HTTPException, status
 from typing import List, Optional
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timedelta
 from bson import ObjectId
+import random
+import string
 
 from app.core.database import db
 
@@ -10,6 +12,14 @@ router = APIRouter(prefix="/study-sets", tags=["Study Sets"])
 
 # Get study sets collection
 study_sets_collection = db["study_sets"]
+study_set_sessions_collection = db["study_set_sessions"]
+
+
+# Helper function to generate share code
+def generate_share_code(length=6):
+    """Generate a random alphanumeric share code"""
+    characters = string.ascii_uppercase + string.digits
+    return ''.join(random.choice(characters) for _ in range(length))
 
 
 # Pydantic Models
@@ -264,3 +274,153 @@ async def get_study_set_stats(study_set_id: str):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to fetch study set stats: {str(e)}"
         )
+
+
+@router.post("/{study_set_id}/create-share-code")
+async def create_study_set_share_code(study_set_id: str):
+    """Create a share code for a study set (valid for 10 minutes)"""
+    try:
+        # Verify study set exists
+        study_set = await study_sets_collection.find_one({"_id": ObjectId(study_set_id)})
+        if not study_set:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Study set not found"
+            )
+        
+        # Generate unique share code
+        share_code = generate_share_code()
+        
+        # Ensure uniqueness
+        while await study_set_sessions_collection.find_one({"share_code": share_code}):
+            share_code = generate_share_code()
+        
+        # Calculate expiration (10 minutes from now)
+        created_at = datetime.utcnow()
+        expires_at = created_at + timedelta(minutes=10)
+        expires_in = 600  # 10 minutes in seconds
+        
+        # Create share session document
+        session = {
+            "share_code": share_code,
+            "study_set_id": study_set_id,
+            "owner_id": study_set.get("ownerId"),
+            "is_active": True,
+            "created_at": created_at,
+            "expires_at": expires_at,
+            "study_set_name": study_set.get("name", "Untitled Study Set")
+        }
+        
+        await study_set_sessions_collection.insert_one(session)
+        
+        return {
+            "success": True,
+            "share_code": share_code,
+            "expires_in": expires_in,
+            "expires_at": expires_at.isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error creating share code: {str(e)}"
+        )
+
+
+@router.post("/add-to-library")
+async def add_study_set_to_library(data: dict):
+    """Add a study set to user's library using a share code"""
+    try:
+        share_code = data.get("share_code")
+        user_id = data.get("user_id")
+        
+        if not share_code or not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Missing share_code or user_id"
+            )
+        
+        # Find the share session
+        session = await study_set_sessions_collection.find_one({"share_code": share_code})
+        
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Invalid or expired share code"
+            )
+        
+        # Check if expired
+        if session["expires_at"] < datetime.utcnow():
+            await study_set_sessions_collection.delete_one({"share_code": share_code})
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail="Share code has expired"
+            )
+        
+        # Get the original study set
+        original_study_set = await study_sets_collection.find_one(
+            {"_id": ObjectId(session["study_set_id"])}
+        )
+        
+        if not original_study_set:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Study set not found"
+            )
+        
+        original_owner_id = original_study_set.get("ownerId")
+        
+        # Check if user already has this study set
+        if original_owner_id == user_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="You are the owner of this study set"
+            )
+        
+        # Check if user already has a copy
+        existing = await study_sets_collection.find_one({
+            "ownerId": user_id,
+            "originalOwner": original_owner_id,
+            "name": original_study_set.get("name")
+        })
+        
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="You already have this study set in your library"
+            )
+        
+        # Create a copy of the study set for the user
+        new_study_set = {
+            "name": original_study_set.get("name"),
+            "description": original_study_set.get("description"),
+            "language": original_study_set.get("language"),
+            "category": original_study_set.get("category"),
+            "coverImagePath": original_study_set.get("coverImagePath"),
+            "ownerId": user_id,
+            "originalOwner": original_owner_id,
+            "quizzes": original_study_set.get("quizzes", []),
+            "flashcardSets": original_study_set.get("flashcardSets", []),
+            "notes": original_study_set.get("notes", []),
+            "createdAt": datetime.utcnow().strftime("%B, %Y"),
+            "updatedAt": datetime.utcnow().isoformat()
+        }
+        
+        result = await study_sets_collection.insert_one(new_study_set)
+        new_study_set_id = str(result.inserted_id)
+        
+        return {
+            "success": True,
+            "study_set_id": new_study_set_id,
+            "study_set_name": new_study_set.get("name", "Untitled Study Set"),
+            "message": "Study set added to your library successfully"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error adding study set: {str(e)}"
+        )
+
