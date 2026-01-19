@@ -28,6 +28,11 @@ wheels/
 .env.local
 .env.*.local
 
+# Credentials (NEVER commit secrets!)
+credentials/
+*.json
+!package.json
+
 # IDEs
 .vscode/
 .idea/

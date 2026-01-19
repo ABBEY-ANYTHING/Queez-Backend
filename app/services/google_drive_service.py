@@ -12,16 +12,35 @@ from io import BytesIO
 
 # Configuration
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
-CREDENTIALS_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 
-                                 'credentials', 'google_drive_service_account.json')
-QUEEZ_FOLDER_ID = '16DdrQsK0_m_jgeSAlxBUryzulHQEvyCB'  # Your folder ID
+QUEEZ_FOLDER_ID = os.getenv('GOOGLE_DRIVE_FOLDER_ID', '16DdrQsK0_m_jgeSAlxBUryzulHQEvyCB')
+
+# Load credentials from environment variable or file
+def _get_credentials_info():
+    # First try environment variable (JSON string)
+    creds_json = os.getenv('GOOGLE_DRIVE_CREDENTIALS')
+    if creds_json:
+        return json.loads(creds_json)
+    
+    # Fallback to file
+    creds_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 
+                              'credentials', 'google_drive_service_account.json')
+    if os.path.exists(creds_path):
+        with open(creds_path, 'r') as f:
+            return json.load(f)
+    
+    return None
 
 
 def get_drive_service():
     """Get authenticated Google Drive service using service account"""
     try:
-        credentials = service_account.Credentials.from_service_account_file(
-            CREDENTIALS_PATH, scopes=SCOPES
+        creds_info = _get_credentials_info()
+        if not creds_info:
+            print("No Google Drive credentials found. Set GOOGLE_DRIVE_CREDENTIALS env var or provide credentials file.")
+            return None
+        
+        credentials = service_account.Credentials.from_service_account_info(
+            creds_info, scopes=SCOPES
         )
         service = build('drive', 'v3', credentials=credentials)
         return service
