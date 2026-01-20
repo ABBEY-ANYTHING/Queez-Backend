@@ -147,6 +147,55 @@ async def delete_flashcard_set(flashcard_set_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.put("/{flashcard_set_id}", response_model=FlashcardSetResponse, summary="Update a flashcard set")
+async def update_flashcard_set(flashcard_set_id: str, flashcard_set: FlashcardSet):
+    try:
+        if not ObjectId.is_valid(flashcard_set_id):
+            raise HTTPException(status_code=400, detail="Invalid flashcard set ID")
+        
+        # Validate required fields
+        if not flashcard_set.title or not flashcard_set.title.strip():
+            raise HTTPException(status_code=400, detail="Title cannot be empty")
+        
+        if not flashcard_set.cards or len(flashcard_set.cards) == 0:
+            raise HTTPException(status_code=400, detail="Flashcard set must have at least one card")
+        
+        # Check if the flashcard set exists
+        existing_set = await flashcard_collection.find_one({"_id": ObjectId(flashcard_set_id)})
+        if not existing_set:
+            raise HTTPException(status_code=404, detail="Flashcard set not found")
+        
+        # Build update document
+        update_data = {
+            "title": flashcard_set.title.strip(),
+            "description": flashcard_set.description.strip() if flashcard_set.description else "",
+            "category": flashcard_set.category or existing_set.get("category", "Other"),
+            "cards": [card.dict() for card in flashcard_set.cards],
+            "updatedAt": datetime.utcnow().strftime("%B, %Y")
+        }
+        
+        # Update cover image if provided
+        if flashcard_set.coverImagePath:
+            update_data["coverImagePath"] = flashcard_set.coverImagePath
+        
+        result = await flashcard_collection.update_one(
+            {"_id": ObjectId(flashcard_set_id)},
+            {"$set": update_data}
+        )
+        
+        if result.modified_count == 0 and result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Flashcard set not found")
+        
+        return FlashcardSetResponse(
+            id=flashcard_set_id,
+            message="Flashcard set updated successfully"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/add-to-library", summary="Add a flashcard set to user's library")
 async def add_flashcard_to_library(data: dict):
     try:
