@@ -23,6 +23,8 @@ class LibraryItem(BaseModel):
     language: str = ""  # Only for quizzes and course packs
     originalOwner: str | None = None
     originalOwnerUsername: str | None = None
+    originalCoursePackId: str | None = None
+    ownerId: str | None = None
     sharedMode: str | None = None  # Only for quizzes
     # Course pack specific fields
     isPublic: bool = False
@@ -163,77 +165,15 @@ async def get_unified_library(user_id: str):
                 itemCount=total_items,
                 category=course_pack.get("category", ""),
                 language=course_pack.get("language", ""),
-                originalOwner=None,
+                originalOwner=course_pack.get("originalOwner"),
                 originalOwnerUsername=None,
+                originalCoursePackId=course_pack.get("originalCoursePackId"),
+                ownerId=course_pack.get("ownerId"),
                 isPublic=course_pack.get("isPublic", False),
                 rating=course_pack.get("rating", 0.0),
                 enrolledCount=course_pack.get("enrolledCount", 0),
                 estimatedHours=course_pack.get("estimatedHours", 0.0),
                 videoCount=len(course_pack.get('videoLectures', []))
-            ))
-        
-        # Fetch study sets from MongoDB
-        study_sets = []
-        try:
-            study_set_cursor = study_sets_collection.find({"ownerId": user_id})
-            study_sets = await study_set_cursor.to_list(length=None)
-        except Exception as e:
-            print(f"Error fetching study sets: {e}")
-        
-        # Convert study sets to LibraryItem
-        for study_set in study_sets:
-            # Use the custom 'id' field if it exists, otherwise use MongoDB _id
-            study_set_id = study_set.get("id", str(study_set["_id"]))
-            
-            total_items = (
-                len(study_set.get('quizzes', [])) +
-                len(study_set.get('flashcardSets', [])) +
-                len(study_set.get('notes', []))
-            )
-            library_items.append(LibraryItem(
-                id=study_set_id,
-                type="study_set",
-                title=study_set.get("name", "Untitled Study Set"),
-                description=study_set.get("description", ""),
-                coverImagePath=study_set.get("coverImagePath") or fallback_image,
-                createdAt=study_set.get("createdAt", ""),
-                itemCount=total_items,
-                category=study_set.get("category", ""),
-                language=study_set.get("language", ""),
-                originalOwner=study_set.get("originalOwner"),
-                originalOwnerUsername=None
-            ))
-        
-        # Fetch study sets from MongoDB
-        study_sets = []
-        try:
-            study_set_cursor = study_sets_collection.find({"ownerId": user_id})
-            study_sets = await study_set_cursor.to_list(length=None)
-        except Exception as e:
-            print(f"Error fetching study sets: {e}")
-        
-        # Convert study sets to LibraryItem
-        for study_set in study_sets:
-            # Use the custom 'id' field if it exists, otherwise use MongoDB _id
-            study_set_id = study_set.get("id", str(study_set["_id"]))
-            
-            total_items = (
-                len(study_set.get('quizzes', [])) +
-                len(study_set.get('flashcardSets', [])) +
-                len(study_set.get('notes', []))
-            )
-            library_items.append(LibraryItem(
-                id=study_set_id,
-                type="study_set",
-                title=study_set.get("name", "Untitled Study Set"),
-                description=study_set.get("description", ""),
-                coverImagePath=study_set.get("coverImagePath") or fallback_image,
-                createdAt=study_set.get("createdAt", ""),
-                itemCount=total_items,
-                category=study_set.get("category", ""),
-                language=study_set.get("language", ""),
-                originalOwner=study_set.get("originalOwner"),
-                originalOwnerUsername=None
             ))
         
         # Sort by createdAt (most recent first)

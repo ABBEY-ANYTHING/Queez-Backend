@@ -589,6 +589,27 @@ async def claim_course_pack(course_pack_id: str, request: ClaimCourseRequest):
         )
 
 
+@router.get("/user/{user_id}/claimed/{course_pack_id}")
+async def check_claimed_status(user_id: str, course_pack_id: str):
+    """Check if user has already claimed a course pack"""
+    try:
+        # Check if user has any course where originalCoursePackId matches the given course_pack_id
+        claimed_course = await course_pack_collection.find_one({
+            "ownerId": user_id,
+            "originalCoursePackId": course_pack_id
+        })
+        
+        return {
+            "claimed": claimed_course is not None,
+            "claimedCourseId": str(claimed_course["_id"]) if claimed_course else None
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to check claimed status: {str(e)}"
+        )
+
+
 @router.post("/{course_pack_id}/rate")
 async def rate_course_pack(course_pack_id: str, rating: float):
     """Rate a course pack (updates average rating)"""

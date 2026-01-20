@@ -10,9 +10,11 @@ from app.core.database import db
 
 router = APIRouter(prefix="/study-sets", tags=["Study Sets"])
 
-# Get study sets collection
+# Get study sets collection (deprecated - use course_pack instead)
 study_sets_collection = db["study_sets"]
 study_set_sessions_collection = db["study_set_sessions"]
+# Fallback to course_pack collection for backward compatibility
+course_pack_collection = db["course_pack"]
 
 
 # Helper function to generate share code
@@ -23,15 +25,23 @@ def generate_share_code(length=6):
 
 
 # Helper function to find study set by either MongoDB ObjectId or custom UUID
-async def find_study_set_by_id(study_set_id: str):
-    """Find a study set by either MongoDB _id (ObjectId) or custom id field (UUID)"""
+    Also checks course_pack collection as fallback since study_sets is deprecated"""
     study_set = None
     
-    # First try as MongoDB ObjectId (24-character hex string)
+    # First try as MongoDB ObjectId (24-character hex string) in study_sets
     if ObjectId.is_valid(study_set_id):
         study_set = await study_sets_collection.find_one({"_id": ObjectId(study_set_id)})
     
-    # If not found, try custom id field (UUID format)
+    # If not found, try custom id field (UUID format) in study_sets
+    if not study_set:
+        study_set = await study_sets_collection.find_one({"id": study_set_id})
+    
+    # Fallback: Try course_pack collection (new location)
+    if not study_set and ObjectId.is_valid(study_set_id):
+        study_set = await course_pack_collection.find_one({"_id": ObjectId(study_set_id)})
+    
+    if not study_set:
+        study_set = await course_packeld (UUID format)
     if not study_set:
         study_set = await study_sets_collection.find_one({"id": study_set_id})
     
@@ -231,7 +241,7 @@ async def update_study_set(study_set_id: str, study_set: StudySetCreate):
 
 @router.delete("/{study_set_id}")
 async def delete_study_set(study_set_id: str):
-    """Delete a study set"""
+    """Delete a study set (checks both study_sets and course_pack collections)"""
     try:
         existing = await find_study_set_by_id(study_set_id)
         
@@ -247,7 +257,10 @@ async def delete_study_set(study_set_id: str):
         else:
             query = {"id": study_set_id}
         
-        await study_sets_collection.delete_one(query)
+        # Try deleting from study_sets first, then course_pack
+        result = await study_sets_collection.delete_one(query)
+        if result.deleted_count == 0:
+            result = await course_pack_collection.delete_one(query)
         
         return {
             "success": True,

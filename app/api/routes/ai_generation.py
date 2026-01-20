@@ -273,7 +273,7 @@ IMPORTANT: Return ONLY valid JSON without any markdown formatting or code blocks
                 "temperature": 0.7,
                 "top_p": 0.95,
                 "top_k": 40,
-                "max_output_tokens": 65536,
+                "max_output_tokens": 20000,  # Reduced from 65536 to prevent truncation
             }
         )
         
@@ -289,6 +289,16 @@ IMPORTANT: Return ONLY valid JSON without any markdown formatting or code blocks
             start = response_text.find("```") + 3
             end = response_text.find("```", start)
             response_text = response_text[start:end].strip()
+        
+        # Validate JSON is complete before parsing
+        if not response_text.rstrip().endswith("}"):
+            logger.warning(f"AI response appears incomplete. Length: {len(response_text)}")
+            # Try to find the last complete JSON object
+            last_brace = response_text.rfind("}")
+            if last_brace > 0:
+                response_text = response_text[:last_brace + 1]
+            else:
+                raise ValueError("Response is not valid JSON and cannot be recovered")
         
         ai_response = json.loads(response_text)
         
@@ -427,9 +437,17 @@ IMPORTANT: Return ONLY valid JSON without any markdown formatting or code blocks
         raise
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse AI response: {str(e)}")
+        logger.error(f"Response preview: {response_text[:500]}..." if len(response_text) > 500 else f"Response: {response_text}")
+        logger.error(f"Total response length: {len(response_text)} characters")
         raise HTTPException(
             status_code=500,
-            detail="Failed to parse AI response. Please try again."
+            detail="AI response format error. The model may have generated incomplete content. Please try again with a smaller file or simpler content."
+        )
+    except ValueError as e:
+        logger.error(f"Invalid AI response: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="AI response validation failed. Please try again."
         )
     except Exception as e:
         logger.error(f"Error generating study set: {str(e)}")
