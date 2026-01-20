@@ -121,7 +121,7 @@ class StudySetCreate(BaseModel):
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_study_set(study_set: StudySetCreate):
-    """Create a new study set"""
+    """Create a new study set (saves to course_pack collection)"""
     try:
         study_set_data = study_set.dict()
         
@@ -130,8 +130,12 @@ async def create_study_set(study_set: StudySetCreate):
         study_set_data['createdAt'] = now.strftime("%B, %Y")
         study_set_data['updatedAt'] = datetime.utcnow().isoformat()
         
-        # Save to MongoDB
-        result = await study_sets_collection.insert_one(study_set_data)
+        # Rename 'name' field if frontend sends it (for consistency)
+        if 'name' not in study_set_data and 'title' in study_set_data:
+            study_set_data['name'] = study_set_data.pop('title')
+        
+        # Save to course_pack collection (new location)
+        result = await course_pack_collection.insert_one(study_set_data)
         
         return {
             "id": str(result.inserted_id),
