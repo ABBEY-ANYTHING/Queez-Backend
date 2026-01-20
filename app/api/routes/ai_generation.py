@@ -147,9 +147,9 @@ async def generate_study_set(
         
         # Import Gemini SDK
         try:
-            import google.generativeai as genai
+            import google.genai as genai
         except ImportError:
-            logger.error("google-generativeai package not installed")
+            logger.error("google-genai package not installed")
             raise HTTPException(
                 status_code=500,
                 detail="AI generation service not configured"
