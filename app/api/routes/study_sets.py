@@ -8,7 +8,14 @@ import string
 
 from app.core.database import db
 
-router = APIRouter(prefix="/study-sets", tags=["Study Sets"])
+# ============================================================================
+# DEPRECATED: This file is deprecated. All study_sets functionality has been
+# migrated to course_pack.py. This router is NO LONGER REGISTERED in main.py.
+# All endpoints now use /course-pack instead of /study-sets.
+# This file is kept temporarily for reference only.
+# ============================================================================
+
+router = APIRouter(prefix="/study-sets", tags=["Study Sets (DEPRECATED)"])
 
 # Get study sets collection (deprecated - use course_pack instead)
 study_sets_collection = db["study_sets"]
